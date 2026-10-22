@@ -238,6 +238,7 @@ check_run 0 1 '讀回驗證完成' --apply
 
 new_case '較早 Allow 阻止套用' '.customRules.rules = [($desired[0].rules[0] | .name = "AllowEarlier" | .priority = 100 | .action = "Allow")]'
 check_run 1 0 '較早的 Allow' --apply
+grep -Fq 'AllowEarlier (priority=100)' "$MOCK_DIR/output"
 case_name='Allow 風險仍可預覽'
 check_run 0 0 '套用阻礙: 1' --dry-run
 
@@ -258,7 +259,28 @@ for filter in '.policySettings.mode = "Detection"' '.policySettings.enabledState
     jq -e --slurpfile before "$MOCK_DIR/policy.json" '. == $before[0]' "${backup%/*}/original-policy.json" >/dev/null
     case_name="不安全狀態禁止套用: $filter"
     check_run 1 0 '套用前置條件不符' --apply
+    case "$filter" in
+        '.policySettings.mode = "Detection"') reason='policySettings.mode 目前為 "Detection"，要求為 Prevention' ;;
+        '.policySettings.enabledState = "Disabled"') reason='policySettings.enabledState 目前為 "Disabled"，要求為 Enabled' ;;
+        '.securityPolicyLinks = []') reason='securityPolicyLinks 與 frontendEndpointLinks 合計為 0' ;;
+        '.provisioningState = "Updating"') reason='provisioningState 目前為 "Updating"，要求為 Succeeded' ;;
+    esac
+    grep -Fq "$reason" "$MOCK_DIR/output"
 done
+
+new_case '同時列出所有套用阻礙及具體原因' '.policySettings.mode = "Detection" | .policySettings.enabledState = "Disabled" | .provisioningState = "Failed" | .securityPolicyLinks = [] | .customRules.rules = [($desired[0].rules[0] | .name = "AllowEarlier" | .priority = 100 | .action = "Allow")]'
+check_run 1 0 '套用前置條件不符（5 項）' --apply
+for reason in 'enabledState 目前為 "Disabled"' 'mode 目前為 "Detection"' 'provisioningState 目前為 "Failed"' \
+    'securityPolicyLinks 與 frontendEndpointLinks 合計為 0' 'AllowEarlier (priority=100)'; do
+    grep -Fq "$reason" "$MOCK_DIR/output"
+done
+case_name='預覽亦列出全部五項套用阻礙'
+check_run 0 0 '套用阻礙: 5' --dry-run
+grep -Fq 'mode 目前為 "Detection"' "$MOCK_DIR/output"
+
+new_case '缺少狀態欄位時明確顯示 null' 'del(.policySettings.mode, .provisioningState)'
+check_run 1 0 'policySettings.mode 目前為 null，要求為 Prevention' --apply
+grep -Fq 'provisioningState 目前為 null，要求為 Succeeded' "$MOCK_DIR/output"
 
 new_case 'Classic frontend 綁定亦可接受' '.securityPolicyLinks = [] | .frontendEndpointLinks = [{id: "/test/frontend"}]'
 check_run 0 1 '讀回驗證完成' --apply

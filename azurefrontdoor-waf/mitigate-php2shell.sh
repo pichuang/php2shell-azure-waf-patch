@@ -276,28 +276,33 @@ if jq -e 'length > 0' "$work_dir/earlier.json" >/dev/null; then
     jq . "$work_dir/earlier.json" >&2
 fi
 
-blockers=0
-if ! jq -e '.policySettings.enabledState == "Enabled" and .policySettings.mode == "Prevention"' "$work_dir/before.json" >/dev/null; then
-    warn '套用需要已啟用的 Prevention policy；不會自動修改全域設定'
-    blockers=1
+block_reasons=()
+if ! jq -e '.policySettings.enabledState == "Enabled"' "$work_dir/before.json" >/dev/null; then
+    block_reasons+=("policySettings.enabledState 目前為 $(jq -r '.policySettings.enabledState | tojson' "$work_dir/before.json")，要求為 Enabled。請確認啟用此 PHP 專用 WAF policy 的影響後，由操作人員調整；腳本不會自動啟用。")
+fi
+if ! jq -e '.policySettings.mode == "Prevention"' "$work_dir/before.json" >/dev/null; then
+    block_reasons+=("policySettings.mode 目前為 $(jq -r '.policySettings.mode | tojson' "$work_dir/before.json")，要求為 Prevention。Detection 不會封鎖請求；請先評估誤判及流量影響，再由操作人員調整，腳本不會自動切換模式。")
 fi
 if ! jq -e '.provisioningState == "Succeeded"' "$work_dir/before.json" >/dev/null; then
-    warn 'policy provisioningState 尚未 Succeeded'
-    blockers=1
+    block_reasons+=("provisioningState 目前為 $(jq -r '.provisioningState | tojson' "$work_dir/before.json")，要求為 Succeeded。Updating 請等待既有更新完成；Failed 請先排查失敗原因；其他值或 null 請確認資源狀態後重試。")
 fi
 if ! jq -e '((.securityPolicyLinks // []) + (.frontendEndpointLinks // [])) | length > 0' "$work_dir/before.json" >/dev/null; then
-    warn '未發現 policy 綁定，無法證明請求會經過此 WAF'
-    blockers=1
+    block_reasons+=("未發現 policy 綁定：securityPolicyLinks 與 frontendEndpointLinks 合計為 0，要求至少 1 個綁定參照。請確認目標 policy，以及 Front Door 的 security policy 或 Classic frontend endpoint 綁定；腳本不會建立或修改綁定。")
 fi
 if jq -e 'any(.[]; .action == "Allow")' "$work_dir/earlier.json" >/dev/null; then
-    warn '較早的 Allow 可略過後續緩解規則，請先人工處理'
-    blockers=1
+    block_reasons+=("較早的 Allow 可略過後續緩解規則：$(jq -r '[.[] | select(.action == "Allow") | "\(.name) (priority=\(.priority))"] | join(", ")' "$work_dir/earlier.json")。要求沒有會先放行的已啟用 Allow 規則；請審查上列完整條件，由操作人員確認是否需調整範圍或優先順序，腳本不會修改既有規則。")
 fi
+blockers=${#block_reasons[@]}
 if [[ "$mode" == dry-run ]]; then
     printf '僅預覽，未寫入 Azure。套用阻礙: %s\n' "$blockers"
+    if [[ "$blockers" != 0 ]]; then
+        printf '  - %s\n' "${block_reasons[@]}" >&2
+    fi
     exit 0
 fi
-[[ "$blockers" == 0 ]] || die '套用前置條件不符，未寫入 Azure'
+if [[ "$blockers" != 0 ]]; then
+    die "$(printf '套用前置條件不符（%s 項），未寫入 Azure。原因與處理方向：\n' "$blockers"; printf '  - %s\n' "${block_reasons[@]}")"
+fi
 if jq -e '.added | length == 0' "$work_dir/plan.json" >/dev/null; then
     printf '三條規則均相同，無需更新。\n'
     exit 0

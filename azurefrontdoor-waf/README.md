@@ -75,6 +75,20 @@ chmod +x mitigate-php2shell.sh tests/test-mitigate-php2shell.sh
 
 **併發限制：**更新前重讀不是原子的 If-Match 鎖定。CLI 內部也可能讀取後再寫入；最後一次檢查與寫入之間仍有競態。請安排沒有其他 policy 寫入者的變更窗口。
 
+### 套用前置條件錯誤
+
+`套用前置條件不符` 表示腳本的安全檢查未通過，尚未送出 Azure 更新要求，不是 Azure 更新 API 回傳的錯誤。結尾會列出問題總數、每一項原因、目前值、要求值與人工處理方向；例如 `policySettings.mode 目前為 "Detection"，要求為 Prevention`。若欄位不存在或為空值，會明確顯示 `null`，不會推測目前狀態。
+
+| 檢查項目 | 不通過原因與處理方向 |
+| --- | --- |
+| policySettings.enabledState | 不是 Enabled；確認啟用影響後由操作人員調整 |
+| policySettings.mode | 不是 Prevention；Detection 不封鎖請求，先評估誤判與流量影響再調整 |
+| provisioningState | 不是 Succeeded；Updating 等待完成，Failed 先排查失敗原因，其他值確認資源狀態 |
+| policy 綁定 | securityPolicyLinks 與 frontendEndpointLinks 合計為 0；核對目標 policy 與 Front Door 綁定 |
+| 較早的 Allow | 列出已啟用且可能先放行的規則名稱、priority；依上方完整條件人工審查範圍與順序 |
+
+`--dry-run` 也會列出同樣原因，且「套用阻礙」顯示實際項目數。腳本不會為了通過檢查，自動啟用 policy、切換模式、修改綁定或變更既有 Allow 規則。僅憑舊版的通用錯誤文字無法判定實際原因，可用相同目標參數重新執行 `--dry-run` 查看詳細結果並備份。
+
 ## 套用後驗證
 
 腳本會在本次備份目錄留下原始 policy、原 custom rules、合併結果、實際新增規則清單、manifest，以及寫入後讀回內容。只有完整讀回驗證通過，manifest 的 `controlPlaneVerified` 才會變為 `true`。`--dry-run` 與 `--backup-only` 沒有寫入，因此此欄位維持 `false`，不代表備份失敗。
