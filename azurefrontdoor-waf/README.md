@@ -46,7 +46,7 @@ chmod +x mitigate-php2shell.sh tests/test-mitigate-php2shell.sh
 	--policy-name '<existing-php-waf-policy>'
 ```
 
-預設為 `--dry-run`，會讀取 Azure 並顯示目標 ID、設定、綁定參照、新增、略過清單與完整合併後規則，不寫入 Azure，也不建立持久備份。Disabled、Detection 或無綁定等狀態仍可預覽，但會顯示套用阻礙；規則衝突或配額超限則以非零狀態停止。
+預設為 `--dry-run`，讀取並驗證目標 policy 後立即建立持久備份，再顯示目標 ID、設定、綁定參照、新增、略過清單與完整合併後規則，不寫入 Azure。Disabled、Detection 或無綁定等狀態仍可預覽並備份，但會顯示套用阻礙；規則衝突或配額超限則以非零狀態停止，保留已建立的原始快照。備份失敗時停止預覽。
 
 核對目標、誤判風險與變更內容後，才明確套用：
 
@@ -58,7 +58,7 @@ chmod +x mitigate-php2shell.sh tests/test-mitigate-php2shell.sh
 	--apply
 ```
 
-可用 `--backup-dir '/secure/path'` 改變備份根目錄；預設位於腳本旁的 `backups/`。備份可能含敏感的既有規則與設定，請妥善管理；自訂備份路徑不會自動加入 Git 忽略清單。`--help` 不需要 Azure 登入。
+可用 `--backup-dir '/secure/path'` 改變備份根目錄；預設位於腳本旁的 `backups/`。目錄直接以 `policy_name` 分組，每次執行再建立獨立目錄，例如 `backups/php-policy/php2shell-TIMESTAMP.SUFFIX/`；重跑不會覆寫舊備份，自訂根目錄也使用相同分組方式。備份可能含敏感的既有規則與設定，請妥善管理；自訂備份路徑不會自動加入 Git 忽略清單。`--help` 不需要 Azure 登入。
 
 ### 更新保護
 
@@ -77,7 +77,7 @@ chmod +x mitigate-php2shell.sh tests/test-mitigate-php2shell.sh
 
 ## 套用後驗證
 
-腳本會在本次備份目錄留下原始 policy、原 custom rules、合併結果、實際新增規則清單、manifest，以及寫入後讀回內容。只有完整讀回驗證通過，manifest 的 `controlPlaneVerified` 才會變為 `true`。`--backup-only` 沒有寫入，因此此欄位維持 `false`，不代表備份失敗。
+腳本會在本次備份目錄留下原始 policy、原 custom rules、合併結果、實際新增規則清單、manifest，以及寫入後讀回內容。只有完整讀回驗證通過，manifest 的 `controlPlaneVerified` 才會變為 `true`。`--dry-run` 與 `--backup-only` 沒有寫入，因此此欄位維持 `false`，不代表備份失敗。
 
 ```bash
 az network front-door waf-policy show \
@@ -109,7 +109,7 @@ az network front-door waf-policy show \
 	--backup-only
 ```
 
-輸出會顯示本次備份目錄，也可加 `--backup-dir '/secure/path'` 指定儲存位置。新增緩解規則的 `--apply` 本來就會自動備份；一般回滾請使用**出問題那次套用**輸出的備份目錄，不要任意選取更舊快照。`--backup-only` 不可與 `--apply`、`--dry-run` 或 `--rollback` 同時使用。
+輸出會顯示本次備份目錄，也可加 `--backup-dir '/secure/path'` 指定根目錄。`--dry-run`（含回滾預覽）會先備份目前狀態；新增緩解規則的 `--apply` 也會在寫入前自動備份。一般回滾請使用**出問題那次套用**輸出的備份目錄，不要任意選取更舊快照。成功完成預覽的 dry-run 備份亦記錄預期合併結果，可在實際規則與該結果一致時直接回滾；若預覽因衝突等錯誤提早停止，備份中的預期結果仍為原始規則，不代表計畫已完成。`--backup-only` 不可與 `--apply`、`--dry-run` 或 `--rollback` 同時使用。
 
 備份目錄限制為僅目前使用者可存取（700），檔案預設為 600；請保存整個目錄，不要修改其中內容：
 
@@ -119,7 +119,7 @@ az network front-door waf-policy show \
 | original-custom-rules.json | 該次操作前的完整 custom rules，回滾目標 |
 | merged-custom-rules.json | 該次操作預期寫入的完整 custom rules；獨立備份時與原始規則相同 |
 | added-rules.json | 該次新增的緩解規則；獨立備份與回滾時為空陣列 |
-| manifest.json | 資源 ID、時間、操作類型、回滾來源與寫入驗證狀態 |
+| manifest.json | 資源 ID、時間、操作類型、執行模式、回滾來源與寫入驗證狀態 |
 | verified-after.json | 寫入後的讀回結果，未進入讀回階段時不會存在 |
 
 先預覽回滾，指定整個備份目錄：
@@ -129,7 +129,7 @@ az network front-door waf-policy show \
 	--subscription '<subscription-name-or-id>' \
 	--resource-group '<resource-group>' \
 	--policy-name '<existing-php-waf-policy>' \
-	--rollback './backups/php2shell-TIMESTAMP.SUFFIX'
+	--rollback './backups/<existing-php-waf-policy>/php2shell-TIMESTAMP.SUFFIX'
 ```
 
 確認後，加上 `--apply` 直接執行回滾：
@@ -139,7 +139,7 @@ az network front-door waf-policy show \
 	--subscription '<subscription-name-or-id>' \
 	--resource-group '<resource-group>' \
 	--policy-name '<existing-php-waf-policy>' \
-	--rollback './backups/php2shell-TIMESTAMP.SUFFIX' \
+	--rollback './backups/<existing-php-waf-policy>/php2shell-TIMESTAMP.SUFFIX' \
 	--apply
 ```
 
@@ -168,7 +168,7 @@ az network front-door waf-policy show \
 
 ```bash
 umask 077
-backup='/secure/path/to/php2shell-TIMESTAMP.SUFFIX'
+backup='/secure/path/<existing-php-waf-policy>/php2shell-TIMESTAMP.SUFFIX'
 jq --slurpfile manifest "$backup/manifest.json" \
 	 --slurpfile added "$backup/added-rules.json" \
 	 --slurpfile after "$backup/verified-after.json" '

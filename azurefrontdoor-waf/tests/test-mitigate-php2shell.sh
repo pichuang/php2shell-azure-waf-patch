@@ -144,7 +144,38 @@ check_run 1 0 '不可與' --backup-only --apply
 
 new_case '預設僅預覽'
 check_run 0 0 '僅預覽'
-[[ ! -e "$MOCK_DIR/backups" ]]
+backup=$(find "$MOCK_DIR/backups/php-policy" -name manifest.json -print)
+jq -e '.mode == "dry-run" and .controlPlaneVerified == false' "$backup" >/dev/null
+jq -e '.rules == []' "${backup%/*}/original-custom-rules.json" >/dev/null
+jq -e '.rules | length == 3' "${backup%/*}/merged-custom-rules.json" >/dev/null
+[[ ! -f "${backup%/*}/verified-after.json" ]]
+case_name='明確 dry-run 重跑保留每次快照'
+check_run 0 0 '僅預覽' --dry-run
+[[ $(find "$MOCK_DIR/backups/php-policy" -name manifest.json | awk 'END {print NR}') == 2 ]]
+jq -e '.rules == []' "${backup%/*}/original-custom-rules.json" >/dev/null
+dry_run_backup=${backup%/*}
+case_name='dry-run 後套用緩解規則'
+check_run 0 1 '讀回驗證完成' --apply
+case_name='直接使用 dry-run 備份回滾套用結果'
+check_run 0 1 '完整 custom rules 已還原' --rollback "$dry_run_backup" --apply
+jq -e '.customRules.rules == []' "$MOCK_DIR/policy.json" >/dev/null
+jq -e '.mode == "dry-run" and .controlPlaneVerified == false' "$dry_run_backup/manifest.json" >/dev/null
+
+new_case '規則衝突的 dry-run 也先備份' '.customRules.rules = [($desired[0].rules[0] | .action = "Log")]'
+check_run 1 0 '同名規則內容不同' --dry-run
+backup=$(find "$MOCK_DIR/backups/php-policy" -name manifest.json -print)
+jq -e --slurpfile before "$MOCK_DIR/policy.json" '. == $before[0].customRules' "${backup%/*}/original-custom-rules.json" >/dev/null
+
+new_case 'dry-run 備份失敗即停止'
+printf 'blocked\n' > "$MOCK_DIR/blocked"
+check_run 1 0 '備份' --dry-run --backup-dir "$MOCK_DIR/blocked/subdir"
+
+new_case '自訂根目錄仍以 policy 名稱分組'
+check_run 0 0 '僅預覽' --dry-run --backup-dir "$MOCK_DIR/custom root"
+[[ $(find "$MOCK_DIR/custom root/php-policy" -name manifest.json | awk 'END {print NR}') == 1 ]]
+
+new_case 'policy 名稱不可作為路徑穿越'
+check_run 1 0 'policy-name' --policy-name ../other --dry-run
 
 new_case '空集合一次套用，容忍 Azure 回傳的預設欄位'
 check_run 0 1 '讀回驗證完成' --apply
@@ -159,6 +190,8 @@ check_run 0 0 '無需更新' --apply
 
 case_name='回滾預覽零寫入'
 check_run 0 0 '回滾僅預覽' --rollback "${backup%/*}"
+[[ $(find "$MOCK_DIR/backups/php-policy" -name manifest.json | awk 'END {print NR}') == 2 ]]
+jq -e '.controlPlaneVerified == true' "$backup" >/dev/null
 case_name='回滾還原空集合'
 check_run 0 1 '回滾完成' --rollback "${backup%/*}" --apply
 jq -e '.rules == []' "$MOCK_DIR/submitted.json" >/dev/null
@@ -171,7 +204,7 @@ jq -e '.rules | length == 4 and .[0].name == "Existing" and .[0].priority == 200
 
 new_case '部分規則已存在' '.customRules.rules = [$desired[0].rules[1]]'
 check_run 0 1 '讀回驗證完成' --apply
-jq -e 'length == 2 and all(.[]; .name != "PhpFormNesting20")' "$MOCK_DIR"/backups/*/added-rules.json >/dev/null
+jq -e 'length == 2 and all(.[]; .name != "PhpFormNesting20")' "$MOCK_DIR"/backups/php-policy/*/added-rules.json >/dev/null
 
 new_case '同名異內容不覆寫' '.customRules.rules = [($desired[0].rules[1] | .action = "Block")]'
 check_run 1 0 '同名規則內容不同' --apply
@@ -221,6 +254,8 @@ for filter in '.policySettings.mode = "Detection"' '.policySettings.enabledState
     '.securityPolicyLinks = []' '.provisioningState = "Updating"'; do
     new_case "不安全狀態可預覽: $filter" "$filter"
     check_run 0 0 '套用阻礙: 1'
+    backup=$(find "$MOCK_DIR/backups/php-policy" -name manifest.json -print)
+    jq -e --slurpfile before "$MOCK_DIR/policy.json" '. == $before[0]' "${backup%/*}/original-policy.json" >/dev/null
     case_name="不安全狀態禁止套用: $filter"
     check_run 1 0 '套用前置條件不符' --apply
 done
@@ -260,7 +295,7 @@ for failure in update timeout verify unrelated; do
     MOCK_FAILURE=$failure
     check_run 1 1 '備份' --apply
     [[ -n $(find "$MOCK_DIR/backups" -name original-policy.json -print) ]]
-    jq -e '.controlPlaneVerified == false' "$MOCK_DIR"/backups/*/manifest.json >/dev/null
+    jq -e '.controlPlaneVerified == false' "$MOCK_DIR"/backups/php-policy/*/manifest.json >/dev/null
 done
 
 for missing in az jq; do
@@ -384,7 +419,7 @@ for failure in update timeout verify unrelated; do
     MOCK_FAILURE=$failure
     case_name="回滾失敗保留備份，不連鎖回滾: $failure"
     check_run 1 1 '備份' --rollback "$rollback_backup" --apply
-    jq -e '.operation != "rollback" or .controlPlaneVerified == false' "$MOCK_DIR"/backups/*/manifest.json >/dev/null
+    jq -e '.operation != "rollback" or .controlPlaneVerified == false' "$MOCK_DIR"/backups/php-policy/*/manifest.json >/dev/null
 done
 
 new_case '強制回滾旗標不可單獨使用'

@@ -8,7 +8,8 @@ usage() {
         '獨立備份: 同一組目標參數加 --backup-only，可搭配 --backup-dir DIR；不寫入 Azure。' \
         '回滾預覽: 同一組目標參數加 --rollback BACKUP_DIR；加 --apply 才還原完整 custom rules。' \
         '回滾遇到備份後的其他 custom rules 變更時停止；--force-rollback 明確允許覆寫這些變更。' \
-        '預設僅預覽；--apply 才修改既有 PHP 專用 Front Door WAF policy。' \
+        '預設僅預覽並備份；--apply 才修改既有 PHP 專用 Front Door WAF policy。' \
+        '備份位置: backups/POLICY_NAME/每次執行目錄；--backup-dir 可更改備份根目錄。' \
         'priority 固定為 500/501/502，動作為 Block/Log/Log。不修改 policy 綁定或全域設定。' \
         '套用前請確認此 policy 僅涵蓋受影響的 PHP 網域及路由，且變更期間沒有其他寫入者。'
 }
@@ -58,6 +59,8 @@ fi
 [[ "$force_rollback" == 0 || "$operation" == rollback ]] || die '--force-rollback 僅可搭配 --rollback'
 [[ "$operation" != backup || -z "$mode_selected" ]] || die '--backup-only 不可與 --dry-run 或 --apply 同時使用'
 [[ -n "$subscription" && -n "$resource_group" && -n "$policy_name" ]] || { usage >&2; die '請提供三個目標參數'; }
+[[ "$policy_name" != */* && "$policy_name" != *\\* && "$policy_name" != . && "$policy_name" != .. ]] \
+    || die 'policy-name 不可包含路徑分隔符或為 .、..'
 for dependency in az jq; do
     command -v "$dependency" >/dev/null 2>&1 || die "缺少必要工具: $dependency"
 done
@@ -82,16 +85,21 @@ get_policy() {
     az network front-door waf-policy show "${target[@]}" --output json > "$1" || die '無法讀取 WAF policy；請確認目標、登入與讀取權限'
 }
 
-persist_backup() {
-    mkdir -p -- "$backup_root" || die '無法建立備份根目錄'
-    backup_path=$(mktemp -d "$backup_root/php2shell-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") || die '無法建立備份目錄'
-    cp "$work_dir/before.json" "$backup_path/original-policy.json"
-    jq '(.customRules // {rules: []}) | .rules = (.rules // [])' "$work_dir/before.json" > "$backup_path/original-custom-rules.json"
+save_backup_plan() {
     cp "$work_dir/merged.json" "$backup_path/merged-custom-rules.json"
     jq '.added' "$work_dir/plan.json" > "$backup_path/added-rules.json"
+}
+
+persist_backup() {
+    local policy_backup_root="$backup_root/$policy_name"
+    mkdir -p -- "$policy_backup_root" || die '無法建立 policy 備份目錄'
+    backup_path=$(mktemp -d "$policy_backup_root/php2shell-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") || die '無法建立備份目錄'
+    cp "$work_dir/before.json" "$backup_path/original-policy.json"
+    jq '(.customRules // {rules: []}) | .rules = (.rules // [])' "$work_dir/before.json" > "$backup_path/original-custom-rules.json"
+    save_backup_plan
     jq -n --arg id "$(jq -r .id "$work_dir/before.json")" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg operation "$operation" --arg source "$rollback_source" \
-        '{resourceId: $id, createdAt: $time, operation: $operation, rollbackSource: $source, controlPlaneVerified: false}' > "$backup_path/manifest.json"
+        --arg operation "$operation" --arg source "$rollback_source" --arg mode "$mode" \
+        '{resourceId: $id, createdAt: $time, operation: $operation, mode: $mode, rollbackSource: $source, controlPlaneVerified: false}' > "$backup_path/manifest.json"
     printf '備份: %s\n' "$backup_path"
 }
 
@@ -148,12 +156,14 @@ jq -e --arg id "$expected_id" '
 printf '目標: %s\n' "$(jq -r '.id' "$work_dir/before.json")"
 jq '{sku: .sku.name, provisioningState, policySettings, frontendEndpointLinks, securityPolicyLinks}' "$work_dir/before.json"
 
-if [[ "$operation" == backup ]]; then
+if [[ "$operation" == backup || "$mode" == dry-run ]]; then
     jq '(.customRules // {rules: []}) | .rules = (.rules // [])' "$work_dir/before.json" > "$work_dir/merged.json"
     printf '{"added":[]}\n' > "$work_dir/plan.json"
     persist_backup
-    printf '既有 custom rules 備份完成，未寫入 Azure。\n'
-    exit 0
+    if [[ "$operation" == backup ]]; then
+        printf '既有 custom rules 備份完成，未寫入 Azure。\n'
+        exit 0
+    fi
 fi
 
 if [[ "$operation" == rollback ]]; then
@@ -182,6 +192,9 @@ if [[ "$operation" == rollback ]]; then
         || die '回滾備份的預期規則格式不符'
     cp "$work_dir/rollback-original-custom-rules.json" "$work_dir/merged.json"
     printf '{"added":[]}\n' > "$work_dir/plan.json"
+    if [[ "$mode" == dry-run ]]; then
+        save_backup_plan
+    fi
     printf '回滾來源: %s\n回滾將還原以下完整 custom rules（其餘 policy 設定維持目前值）:\n' "$rollback_source"
     jq . "$work_dir/merged.json"
     if [[ "$mode" == apply ]]; then
@@ -246,6 +259,9 @@ jq -e --slurpfile before "$work_dir/before.json" '
 
 jq -n --slurpfile before "$work_dir/before.json" --slurpfile plan "$work_dir/plan.json" \
     '($before[0].customRules // {}) | .rules = $plan[0].merged' > "$work_dir/merged.json"
+if [[ "$mode" == dry-run ]]; then
+    save_backup_plan
+fi
 jq '{"新增": [.added[] | {name, priority, action}], "略過": .skipped}' "$work_dir/plan.json"
 printf '預期完整 custom rules:\n'
 jq . "$work_dir/merged.json"
