@@ -1,0 +1,7 @@
+DeviceProcessEvents
+| where DeviceName == "<機器名稱>"
+| where FileName has "php" or InitiatingProcessFileName has "php"
+| project Timestamp, FileName, FolderPath, ProcessCommandLine, SHA256,
+          ProcessVersionInfoProductVersion,
+          InitiatingProcessFileName, InitiatingProcessFolderPath, InitiatingProcessCommandLine
+| take 20

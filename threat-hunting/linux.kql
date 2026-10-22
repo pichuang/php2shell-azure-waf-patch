@@ -1,0 +1,5 @@
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName matches regex @"^php(-fpm|-cgi)?[0-9.]*$"
+    or InitiatingProcessFileName matches regex @"^php(-fpm|-cgi)?[0-9.]*$"
+| summarize LastSeen=max(Timestamp), Paths=make_set(FolderPath), Cmd=make_set(ProcessCommandLine,5) by DeviceName

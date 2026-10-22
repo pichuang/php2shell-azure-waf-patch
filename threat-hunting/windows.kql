@@ -1,0 +1,4 @@
+union DeviceProcessEvents, DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("php.exe","php-cgi.exe","php8ts.dll","php7ts.dll") or InitiatingProcessFileName in~ ("php.exe","php-cgi.exe")
+| summarize LastSeen=max(Timestamp), Paths=make_set(FolderPath) by DeviceName
