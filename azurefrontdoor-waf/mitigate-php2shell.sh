@@ -1,0 +1,205 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+usage() {
+    printf '%s\n' \
+        '用法: mitigate-php2shell.sh --subscription NAME_OR_ID --resource-group RG --policy-name POLICY [--dry-run | --apply] [--backup-dir DIR]' \
+        '預設僅預覽；--apply 才修改既有 PHP 專用 Front Door WAF policy。' \
+        'priority 固定為 500/501/502，動作為 Block/Log/Log。不修改 policy 綁定或全域設定。' \
+        '套用前請確認此 policy 僅涵蓋受影響的 PHP 網域及路由，且變更期間沒有其他寫入者。'
+}
+
+die() { printf '錯誤: %s\n' "$*" >&2; exit 1; }
+warn() { printf '警告: %s\n' "$*" >&2; }
+
+subscription=''
+resource_group=''
+policy_name=''
+mode='dry-run'
+mode_selected=''
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+backup_root="$script_dir/backups"
+backup_path=''
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help|-h) usage; exit 0 ;;
+        --subscription|--resource-group|--policy-name|--backup-dir)
+            [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 缺少值"
+            case "$1" in
+                --subscription) subscription=$2 ;;
+                --resource-group) resource_group=$2 ;;
+                --policy-name) policy_name=$2 ;;
+                --backup-dir) backup_root=$2 ;;
+            esac
+            shift 2 ;;
+        --dry-run|--apply)
+            [[ -z "$mode_selected" || "$mode_selected" == "$1" ]] || die '--dry-run 與 --apply 不可同時使用'
+            mode_selected=$1
+            mode=${1#--}
+            shift ;;
+        *) die "未知參數: $1" ;;
+    esac
+done
+[[ -n "$subscription" && -n "$resource_group" && -n "$policy_name" ]] || { usage >&2; die '請提供三個目標參數'; }
+for dependency in az jq; do
+    command -v "$dependency" >/dev/null 2>&1 || die "缺少必要工具: $dependency"
+done
+export AZURE_EXTENSION_USE_DYNAMIC_INSTALL=no
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/php2shell.XXXXXX")
+trap 'rm -rf -- "$work_dir"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'printf "執行失敗；備份位置: %s\n" "${backup_path:-尚未建立}" >&2' ERR
+
+az version --output json > "$work_dir/version.json" || die '無法讀取 Azure CLI 版本'
+jq -e '.["azure-cli"] | split(".") | map(tonumber) | .[0] > 2 or (.[0] == 2 and .[1] >= 75)' \
+    "$work_dir/version.json" >/dev/null || die '需要 Azure CLI 2.75.0 或更新版本'
+jq -ne 'walk(.) == null' >/dev/null || die '需要 jq 1.6 或更新版本'
+az extension show --name front-door --output json > "$work_dir/extension.json" || die '請先安裝 front-door extension: az extension add --name front-door'
+az account show --subscription "$subscription" --output json > "$work_dir/account.json" || die '無法存取訂用帳戶；請先 az login 並確認權限'
+jq -e '.state == "Enabled" and (.id | type == "string" and length > 0)' "$work_dir/account.json" >/dev/null || die '訂用帳戶不是 Enabled 或回應缺少 ID'
+subscription=$(jq -r '.id' "$work_dir/account.json")
+target=(--subscription "$subscription" --resource-group "$resource_group" --policy-name "$policy_name" --only-show-errors)
+
+get_policy() {
+    az network front-door waf-policy show "${target[@]}" --output json > "$1" || die '無法讀取 WAF policy；請確認目標、登入與讀取權限'
+}
+
+normalizers='
+def clean: walk(if type == "object" then with_entries(select(.value != null)) else . end);
+def rule:
+    .enabledState = (.enabledState // "Enabled")
+    | if .ruleType == "MatchRule" then
+        (if (.rateLimitDurationInMinutes // 1) == 1 then del(.rateLimitDurationInMinutes) else . end)
+        | (if (.rateLimitThreshold // 0) == 0 then del(.rateLimitThreshold) else . end)
+        | (if (.groupBy // []) == [] then del(.groupBy) else . end)
+      else . end
+    | .matchConditions |= (map(
+        .negateCondition = (if .negateCondition == null then false else .negateCondition end)
+        | .transforms = (.transforms // [])
+        | (if .selector == "" then del(.selector) else . end)
+        | .matchValue |= sort
+      ) | sort_by(.matchVariable, .selector, .operator, .matchValue))
+    | clean;
+def custom: (. // {rules: []}) | .rules = ((.rules // []) | map(rule) | sort_by(.name)) | clean;
+def stable: del(.customRules, .etag, .provisioningState, .resourceState, .systemData) | clean;
+'
+
+get_policy "$work_dir/before.json"
+expected_id="/subscriptions/$subscription/resourceGroups/$resource_group/providers/Microsoft.Network/frontdoorWebApplicationFirewallPolicies/$policy_name"
+jq -e --arg id "$expected_id" '
+    (.id | ascii_downcase) == ($id | ascii_downcase)
+    and (.sku.name | IN("Standard_AzureFrontDoor", "Premium_AzureFrontDoor", "Classic_AzureFrontDoor"))
+    and ((.customRules.rules // []) | type == "array")
+    and (.policySettings | type == "object")
+' "$work_dir/before.json" >/dev/null || die 'policy ID、SKU 或回應結構不符預期'
+printf '目標: %s\n' "$(jq -r '.id' "$work_dir/before.json")"
+jq '{sku: .sku.name, provisioningState, policySettings, frontendEndpointLinks, securityPolicyLinks}' "$work_dir/before.json"
+
+desired="$script_dir/php2shell-rules.json"
+jq -e '
+    (.rules | length == 3)
+    and ([.rules[].name] == ["BlockPhpSessionUploadProgress", "PhpFormNesting20", "PhpMultipartNesting20"])
+    and ([.rules[].priority] == [500,501,502])
+    and ([.rules[].action] == ["Block","Log","Log"])
+    and all(.rules[]; .enabledState == "Enabled" and .ruleType == "MatchRule"
+        and (.matchConditions | length == 2)
+        and all(.matchConditions[]; (.matchValue | length > 0) and all(.matchValue[]; length <= 256)))
+' "$desired" >/dev/null || die '規則來源遺失或格式不符預期'
+
+jq -e --slurpfile desired "$desired" "$normalizers"'
+    (.customRules.rules // []) as $existing
+    | if ($existing | group_by(.name | ascii_downcase) | any(.[]; length > 1))
+        or ($existing | group_by(.priority) | any(.[]; length > 1))
+      then error("既有規則名稱或 priority 重複") else . end
+    | reduce $desired[0].rules[] as $wanted
+        ({merged: $existing, added: [], skipped: []};
+         ([.merged[] | select((.name | ascii_downcase) == ($wanted.name | ascii_downcase))]) as $same
+         | if ($same | length) > 0 then
+             if ($same[0] | rule) == ($wanted | rule)
+             then .skipped += [$wanted.name]
+             else error("同名規則內容不同，拒絕覆寫: " + $wanted.name) end
+           elif any(.merged[]; .priority == $wanted.priority)
+           then error("priority 衝突: " + ($wanted.priority | tostring))
+           else .merged += [$wanted] | .added += [$wanted] end)
+' "$work_dir/before.json" > "$work_dir/plan.json" || die '規則合併檢查失敗，未寫入 Azure'
+
+jq -e --slurpfile before "$work_dir/before.json" '
+    (.merged | length <= 100)
+    and (if $before[0].sku.name == "Classic_AzureFrontDoor" then true else
+        ([.merged[] | select(any(.matchConditions[]; .operator == "RegEx"))] | length <= 5) end)
+    and all(.merged[]; (.matchConditions | length <= 10))
+' "$work_dir/plan.json" >/dev/null || die '合併結果超過 custom rules、Regex rules 或條件數量配額'
+
+jq -n --slurpfile before "$work_dir/before.json" --slurpfile plan "$work_dir/plan.json" \
+    '($before[0].customRules // {}) | .rules = $plan[0].merged' > "$work_dir/merged.json"
+jq '{新增: [.added[] | {name, priority, action}], 略過: .skipped}' "$work_dir/plan.json"
+printf '預期完整 custom rules:\n'
+jq . "$work_dir/merged.json"
+
+jq --slurpfile desired "$desired" '
+    [.customRules.rules[]?
+     | select((.enabledState // "Enabled") == "Enabled" and .priority < 502 and .action != "Log")
+     | select(.name as $name | all($desired[0].rules[]; .name != $name))]
+' "$work_dir/before.json" > "$work_dir/earlier.json"
+if jq -e 'length > 0' "$work_dir/earlier.json" >/dev/null; then
+    warn '較早的終止規則可能先處理請求；請審查下列完整條件'
+    jq . "$work_dir/earlier.json" >&2
+fi
+
+blockers=0
+if ! jq -e '.policySettings.enabledState == "Enabled" and .policySettings.mode == "Prevention"' "$work_dir/before.json" >/dev/null; then
+    warn '套用需要已啟用的 Prevention policy；不會自動修改全域設定'
+    blockers=1
+fi
+if ! jq -e '.provisioningState == "Succeeded"' "$work_dir/before.json" >/dev/null; then
+    warn 'policy provisioningState 尚未 Succeeded'
+    blockers=1
+fi
+if ! jq -e '((.securityPolicyLinks // []) + (.frontendEndpointLinks // [])) | length > 0' "$work_dir/before.json" >/dev/null; then
+    warn '未發現 policy 綁定，無法證明請求會經過此 WAF'
+    blockers=1
+fi
+if jq -e 'any(.[]; .action == "Allow")' "$work_dir/earlier.json" >/dev/null; then
+    warn '較早的 Allow 可略過後續緩解規則，請先人工處理'
+    blockers=1
+fi
+if [[ "$mode" == dry-run ]]; then
+    printf '僅預覽，未寫入 Azure。套用阻礙: %s\n' "$blockers"
+    exit 0
+fi
+[[ "$blockers" == 0 ]] || die '套用前置條件不符，未寫入 Azure'
+if jq -e '.added | length == 0' "$work_dir/plan.json" >/dev/null; then
+    printf '三條規則均相同，無需更新。\n'
+    exit 0
+fi
+
+mkdir -p -- "$backup_root" || die '無法建立備份根目錄'
+backup_path=$(mktemp -d "$backup_root/php2shell-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") || die '無法建立備份目錄'
+cp "$work_dir/before.json" "$backup_path/original-policy.json"
+jq '.customRules // {rules: []}' "$work_dir/before.json" > "$backup_path/original-custom-rules.json"
+cp "$work_dir/merged.json" "$backup_path/merged-custom-rules.json"
+jq '.added' "$work_dir/plan.json" > "$backup_path/added-rules.json"
+jq -n --arg id "$(jq -r .id "$work_dir/before.json")" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{resourceId: $id, createdAt: $time}' > "$backup_path/manifest.json"
+printf '備份: %s\n' "$backup_path"
+
+get_policy "$work_dir/recheck.json"
+jq -e --slurpfile before "$work_dir/before.json" '. == $before[0]' "$work_dir/recheck.json" >/dev/null \
+    || die '備份後 policy 已變動；請重新預覽，不會覆寫其他變更'
+if ! az network front-door waf-policy update "${target[@]}" \
+    --custom-rules "@$work_dir/merged.json" --no-wait --output none; then
+    die "更新失敗或結果不確定；不自動回滾。請檢查 Azure 與備份: $backup_path"
+fi
+if ! az network front-door waf-policy wait "${target[@]}" --updated --interval 10 --timeout 600; then
+    die "等待失敗或逾時；更新可能仍在進行。請檢查 Azure 與備份: $backup_path"
+fi
+get_policy "$backup_path/verified-after.json"
+jq -e --slurpfile before "$work_dir/before.json" --slurpfile merged "$work_dir/merged.json" "$normalizers"'
+    .provisioningState == "Succeeded"
+    and ((.customRules | custom) == ($merged[0] | custom))
+    and ((. | stable) == ($before[0] | stable))
+' "$backup_path/verified-after.json" >/dev/null || die "讀回驗證不符；不自動回滾。請檢查備份: $backup_path"
+printf '控制平面更新與讀回驗證完成。尚須驗證實際流量與 WAF 記錄；Log 規則不阻擋請求。\n'
