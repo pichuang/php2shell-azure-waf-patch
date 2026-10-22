@@ -135,7 +135,7 @@ jq -e --slurpfile before "$work_dir/before.json" '
 
 jq -n --slurpfile before "$work_dir/before.json" --slurpfile plan "$work_dir/plan.json" \
     '($before[0].customRules // {}) | .rules = $plan[0].merged' > "$work_dir/merged.json"
-jq '{新增: [.added[] | {name, priority, action}], 略過: .skipped}' "$work_dir/plan.json"
+jq '{"新增": [.added[] | {name, priority, action}], "略過": .skipped}' "$work_dir/plan.json"
 printf '預期完整 custom rules:\n'
 jq . "$work_dir/merged.json"
 
@@ -183,7 +183,7 @@ jq '.customRules // {rules: []}' "$work_dir/before.json" > "$backup_path/origina
 cp "$work_dir/merged.json" "$backup_path/merged-custom-rules.json"
 jq '.added' "$work_dir/plan.json" > "$backup_path/added-rules.json"
 jq -n --arg id "$(jq -r .id "$work_dir/before.json")" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{resourceId: $id, createdAt: $time}' > "$backup_path/manifest.json"
+    '{resourceId: $id, createdAt: $time, controlPlaneVerified: false}' > "$backup_path/manifest.json"
 printf '備份: %s\n' "$backup_path"
 
 get_policy "$work_dir/recheck.json"
@@ -202,4 +202,6 @@ jq -e --slurpfile before "$work_dir/before.json" --slurpfile merged "$work_dir/m
     and ((.customRules | custom) == ($merged[0] | custom))
     and ((. | stable) == ($before[0] | stable))
 ' "$backup_path/verified-after.json" >/dev/null || die "讀回驗證不符；不自動回滾。請檢查備份: $backup_path"
+jq '.controlPlaneVerified = true' "$backup_path/manifest.json" > "$work_dir/verified-manifest.json"
+mv "$work_dir/verified-manifest.json" "$backup_path/manifest.json"
 printf '控制平面更新與讀回驗證完成。尚須驗證實際流量與 WAF 記錄；Log 規則不阻擋請求。\n'
