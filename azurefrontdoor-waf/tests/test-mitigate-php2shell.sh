@@ -56,7 +56,7 @@ mock_az() {
                     cp "$payload" "$MOCK_DIR/submitted.json"
                     [[ "${MOCK_FAILURE:-}" != update ]] || return 1
                     jq --slurpfile merged "$payload" '
-                        .customRules = $merged[0] | .etag = "after"
+                        .customRules = $merged[0] | .etag = "after" | .provisioningState = "Succeeded"
                         | .customRules.rules |= map(
                             .rateLimitDurationInMinutes = (.rateLimitDurationInMinutes // 1)
                             | .rateLimitThreshold = (.rateLimitThreshold // null)
@@ -133,6 +133,15 @@ check_run() {
     printf '通過: %s\n' "$case_name"
 }
 
+new_case '獨立備份不受同名衝突、Detection 或 Allow 影響' '.policySettings.mode = "Detection" | .customRules.rules = [($desired[0].rules[1] | .action = "Allow")]'
+check_run 0 0 '既有 custom rules 備份完成' --backup-only
+backup=$(find "$MOCK_DIR/backups" -name manifest.json -print)
+jq -e '.operation == "backup"' "$backup" >/dev/null
+jq -e --slurpfile before "$MOCK_DIR/policy.json" '. == $before[0].customRules' "${backup%/*}/original-custom-rules.json" >/dev/null
+
+new_case '備份與套用模式互斥'
+check_run 1 0 '不可與' --backup-only --apply
+
 new_case '預設僅預覽'
 check_run 0 0 '僅預覽'
 [[ ! -e "$MOCK_DIR/backups" ]]
@@ -147,6 +156,14 @@ jq -e '(.resourceId | endswith("/php-policy")) and .controlPlaneVerified == true
 
 case_name='相同規則重跑零寫入'
 check_run 0 0 '無需更新' --apply
+
+case_name='回滾預覽零寫入'
+check_run 0 0 '回滾僅預覽' --rollback "${backup%/*}"
+case_name='回滾還原空集合'
+check_run 0 1 '回滾完成' --rollback "${backup%/*}" --apply
+jq -e '.rules == []' "$MOCK_DIR/submitted.json" >/dev/null
+case_name='回滾重跑零寫入'
+check_run 0 0 '無需回滾' --rollback "${backup%/*}" --apply
 
 new_case '保留舊規則與其餘設定' '.customRules.rules = [($desired[0].rules[0] | .name = "Existing" | .priority = 200 | .action = "Log")]'
 check_run 0 1 '讀回驗證完成' --apply
@@ -271,6 +288,113 @@ new_case '缺少參數值'
 check_run 1 0 '缺少值' --policy-name
 new_case '未知參數'
 check_run 1 0 '未知參數' --unknown
+
+change_policy() {
+    jq "$1" "$MOCK_DIR/policy.json" > "$MOCK_DIR/changed.json"
+    mv "$MOCK_DIR/changed.json" "$MOCK_DIR/policy.json"
+}
+
+prepare_rollback() {
+    new_case "$1" "${2:-.}"
+    check_run 0 1 '讀回驗證完成' --apply
+    rollback_manifest=$(find "$MOCK_DIR/backups" -name manifest.json -print)
+    rollback_backup=${rollback_manifest%/*}
+}
+
+prepare_rollback '回滾既有 RateLimitRule 並保留目前其他設定' '.customRules.rules = [($desired[0].rules[0] | .name = "ExistingRateLimit" | .priority = 100 | .ruleType = "RateLimitRule" | .action = "Log" | .rateLimitDurationInMinutes = 1 | .rateLimitThreshold = 100 | .groupBy = [])]'
+change_policy '.policySettings.mode = "Detection" | .policySettings.enabledState = "Disabled" | .tags.owner = "later-owner" | .securityPolicyLinks = []'
+case_name='回滾不受 Disabled、Detection、無綁定影響，保留其他設定'
+check_run 0 1 '回滾完成' --rollback "$rollback_backup" --apply
+jq -e '.customRules.rules | length == 1 and .[0].name == "ExistingRateLimit" and .[0].rateLimitThreshold == 100' "$MOCK_DIR/policy.json" >/dev/null
+jq -e '.policySettings.mode == "Detection" and .policySettings.enabledState == "Disabled" and .tags.owner == "later-owner" and .securityPolicyLinks == []' "$MOCK_DIR/policy.json" >/dev/null
+rollback_safety_backup=$(find "$MOCK_DIR/backups" -name manifest.json ! -path "$rollback_manifest" -print)
+jq -e '.operation == "rollback" and .controlPlaneVerified == true' "$rollback_safety_backup" >/dev/null
+jq -e '.rules | length == 4' "${rollback_safety_backup%/*}/original-custom-rules.json" >/dev/null
+case_name='回滾的備份也可復原回回滾前狀態'
+check_run 0 1 '回滾完成' --rollback "${rollback_safety_backup%/*}" --apply
+jq -e '.customRules.rules | length == 4' "$MOCK_DIR/policy.json" >/dev/null
+
+prepare_rollback '建立後續變更的回滾情境'
+change_policy '.customRules.rules += [(.customRules.rules[0] | .name = "LaterRule" | .priority = 900 | .action = "Log")]'
+case_name='後續規則變更預設拒絕回滾'
+check_run 1 0 '--force-rollback' --rollback "$rollback_backup" --apply
+case_name='強制回滾仍預設只預覽'
+check_run 0 0 '回滾僅預覽' --rollback "$rollback_backup" --force-rollback
+case_name='明確強制回滾才覆寫後續規則'
+check_run 0 1 '回滾完成' --rollback "$rollback_backup" --force-rollback --apply
+jq -e '.rules == []' "$MOCK_DIR/submitted.json" >/dev/null
+
+new_case '獨立快照備份來源'
+check_run 0 0 '備份完成' --backup-only
+rollback_manifest=$(find "$MOCK_DIR/backups" -name manifest.json -print)
+rollback_backup=${rollback_manifest%/*}
+case_name='獨立備份後新增緩解規則'
+check_run 0 1 '讀回驗證完成' --apply
+case_name='獨立快照後未知變更需確認覆寫'
+check_run 1 0 '--force-rollback' --rollback "$rollback_backup" --apply
+case_name='從獨立備份完整還原'
+check_run 0 1 '回滾完成' --rollback "$rollback_backup" --force-rollback --apply
+
+new_case '逾時的未驗證套用備份'
+MOCK_FAILURE=timeout
+check_run 1 1 '等待失敗' --apply
+rollback_manifest=$(find "$MOCK_DIR/backups" -name manifest.json -print)
+rollback_backup=${rollback_manifest%/*}
+MOCK_FAILURE=''
+change_policy '.provisioningState = "Failed"'
+case_name='未驗證備份可在 Failed 狀態回滾'
+check_run 0 1 '回滾完成' --rollback "$rollback_backup" --apply
+jq -e '.customRules.rules == [] and .provisioningState == "Succeeded"' "$MOCK_DIR/policy.json" >/dev/null
+
+for corruption in target original malformed missing; do
+    prepare_rollback "建立備份檢查情境: $corruption"
+    case "$corruption" in
+        target)
+            jq '.resourceId = "/wrong-policy"' "$rollback_manifest" > "$MOCK_DIR/changed.json"
+            mv "$MOCK_DIR/changed.json" "$rollback_manifest" ;;
+        original)
+            jq '.rules = []' "$rollback_backup/original-custom-rules.json" > "$MOCK_DIR/changed.json"
+            jq '.rules = [{name:"Corrupted",priority:900}]' "$MOCK_DIR/changed.json" > "$rollback_backup/original-custom-rules.json" ;;
+        malformed) printf 'invalid-json\n' > "$rollback_backup/original-custom-rules.json" ;;
+        missing) rm "$rollback_backup/manifest.json" ;;
+    esac
+    case_name="回滾拒絕錯誤備份（force 也無法略過）: $corruption"
+    check_run 1 0 '回滾備份' --rollback "$rollback_backup" --force-rollback --apply
+done
+
+prepare_rollback '建立尚在更新的 policy'
+change_policy '.provisioningState = "Updating"'
+case_name='尚在更新時禁止回滾'
+check_run 1 0 '尚在更新' --rollback "$rollback_backup" --force-rollback --apply
+
+prepare_rollback '建立回滾前備份失敗情境'
+printf 'blocked\n' > "$MOCK_DIR/blocked"
+case_name='回滾前備份失敗零寫入'
+check_run 1 0 '備份' --rollback "$rollback_backup" --apply --backup-dir "$MOCK_DIR/blocked/subdir"
+
+prepare_rollback '建立回滾前併發漂移情境'
+printf '0\n' > "$MOCK_DIR/shows"
+MOCK_FAILURE=drift
+case_name='強制回滾也不略過寫入前的併發檢查'
+check_run 1 0 'policy 已變動' --rollback "$rollback_backup" --force-rollback --apply
+
+for failure in update timeout verify unrelated; do
+    prepare_rollback "建立回滾失敗情境: $failure"
+    rm "$MOCK_DIR/submitted.json"
+    MOCK_FAILURE=$failure
+    case_name="回滾失敗保留備份，不連鎖回滾: $failure"
+    check_run 1 1 '備份' --rollback "$rollback_backup" --apply
+    jq -e '.operation != "rollback" or .controlPlaneVerified == false' "$MOCK_DIR"/backups/*/manifest.json >/dev/null
+done
+
+new_case '強制回滾旗標不可單獨使用'
+check_run 1 0 '僅可搭配' --force-rollback
+new_case '備份與回滾互斥'
+check_run 1 0 '不可同時使用' --backup-only --rollback /unused
+new_case '反向順序仍檢查備份與回滾互斥'
+check_run 1 0 '不可同時使用' --rollback /unused --backup-only
+new_case '回滾參數缺少路徑'
+check_run 1 0 '缺少值' --rollback
 
 for depth in 19 20 21; do
     jq -e --argjson depth "$depth" '

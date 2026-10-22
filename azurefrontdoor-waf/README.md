@@ -21,7 +21,7 @@
 - Bash 3.2 以上，適用 macOS、Linux 與 Azure Cloud Shell 的 Bash 環境。
 - [Azure CLI 2.75.0 以上](https://learn.microsoft.com/en-us/cli/azure/network/front-door/waf-policy?view=azure-cli-latest)、`front-door` extension、jq 1.6 以上。
 - Azure 登入與目標 policy 的讀取、寫入權限，例如適當資源範圍的 Network Contributor，不需要 Owner。預覽只需讀取權限；寫入權限與 Azure Policy 是否允許變更，最終由 Azure 更新要求判定。
-- 既有且已綁定的 Front Door WAF policy；套用要求 `Enabled`、`Prevention`、`provisioningState: Succeeded`。
+- 新增緩解規則時，要求既有且已綁定的 Front Door WAF policy，狀態為 `Enabled`、`Prevention`、`provisioningState: Succeeded`。獨立備份不受這些狀態限制；回滾可在 `Succeeded` 或 `Failed` 狀態執行，不會自動啟用 policy 或改為 Prevention。
 - 人工確認 policy 僅涵蓋受影響的 PHP 網域及路由，包含沒有 `.php` 副檔名的 PHP 路由。綁定參照存在不代表此範圍已正確。
 
 先由操作人員完成安裝與登入；腳本不會自動安裝、登入或切換全域訂用帳戶：
@@ -77,7 +77,7 @@ chmod +x mitigate-php2shell.sh tests/test-mitigate-php2shell.sh
 
 ## 套用後驗證
 
-腳本會在本次備份目錄留下原始 policy、原 custom rules、合併結果、實際新增規則清單、manifest，以及寫入後讀回內容。只有完整讀回驗證通過，manifest 的 `controlPlaneVerified` 才會變為 `true`。
+腳本會在本次備份目錄留下原始 policy、原 custom rules、合併結果、實際新增規則清單、manifest，以及寫入後讀回內容。只有完整讀回驗證通過，manifest 的 `controlPlaneVerified` 才會變為 `true`。`--backup-only` 沒有寫入，因此此欄位維持 `false`，不代表備份失敗。
 
 ```bash
 az network front-door waf-policy show \
@@ -97,9 +97,68 @@ az network front-door waf-policy show \
 
 本工具不建立 diagnostic settings 或監控資源；若沒有 WAF 記錄，就尚未完成資料平面驗證。確認無誤判後才擴大流量，並持續完成 PHP 升級。
 
-## 人工還原
+## 備份與參數回滾
 
-不要將原始完整 policy 或原 custom rules 直接覆寫回 Azure，否則可能抹除後續變更。以下流程僅適用於**成功套用且 manifest 已驗證**的那一次變更；若更新失敗、逾時或驗證失敗，先人工釐清實際 Azure 狀態。
+只備份目前既有 custom rules，不加入緩解規則，也不寫入 Azure：
+
+```bash
+./mitigate-php2shell.sh \
+	--subscription '<subscription-name-or-id>' \
+	--resource-group '<resource-group>' \
+	--policy-name '<existing-php-waf-policy>' \
+	--backup-only
+```
+
+輸出會顯示本次備份目錄，也可加 `--backup-dir '/secure/path'` 指定儲存位置。新增緩解規則的 `--apply` 本來就會自動備份；一般回滾請使用**出問題那次套用**輸出的備份目錄，不要任意選取更舊快照。`--backup-only` 不可與 `--apply`、`--dry-run` 或 `--rollback` 同時使用。
+
+備份目錄限制為僅目前使用者可存取（700），檔案預設為 600；請保存整個目錄，不要修改其中內容：
+
+| 檔案 | 內容 |
+| --- | --- |
+| original-policy.json | 讀取時的完整 policy，僅供核對，不整份還原 |
+| original-custom-rules.json | 該次操作前的完整 custom rules，回滾目標 |
+| merged-custom-rules.json | 該次操作預期寫入的完整 custom rules；獨立備份時與原始規則相同 |
+| added-rules.json | 該次新增的緩解規則；獨立備份與回滾時為空陣列 |
+| manifest.json | 資源 ID、時間、操作類型、回滾來源與寫入驗證狀態 |
+| verified-after.json | 寫入後的讀回結果，未進入讀回階段時不會存在 |
+
+先預覽回滾，指定整個備份目錄：
+
+```bash
+./mitigate-php2shell.sh \
+	--subscription '<subscription-name-or-id>' \
+	--resource-group '<resource-group>' \
+	--policy-name '<existing-php-waf-policy>' \
+	--rollback './backups/php2shell-TIMESTAMP.SUFFIX'
+```
+
+確認後，加上 `--apply` 直接執行回滾：
+
+```bash
+./mitigate-php2shell.sh \
+	--subscription '<subscription-name-or-id>' \
+	--resource-group '<resource-group>' \
+	--policy-name '<existing-php-waf-policy>' \
+	--rollback './backups/php2shell-TIMESTAMP.SUFFIX' \
+	--apply
+```
+
+回滾會把**完整 custom rules 集合還原到該次操作之前**，包含既有規則的條件、動作與 priority；不只移除 500 至 502。不還原 policy settings、managed rules、tags、SKU 或綁定，這些都維持目前值。
+
+- 先核對 manifest 與原始 policy 的資源 ID、SKU、檔案格式及原 custom rules 內容一致性；不符就停止。只接受本工具產生且可信任的備份，不接受任意 JSON 檔案。
+- 目前 custom rules 已與原始快照相同時，零寫入結束。
+- 目前 custom rules 與該次預期寫入結果相同時，允許回滾。若還有其他變更，預設拒絕覆寫。
+- 若確定要捨棄所有備份後的 custom rules 變更，才在同一命令加 `--force-rollback --apply`。可先不加 `--apply` 預覽強制回滾。獨立備份無法預知後續變更，因此從 `--backup-only` 快照還原已變動的規則也需要此確認。
+- `--force-rollback` 只放寬上述規則漂移檢查，不會略過目標、備份內容、目前 provisioning state、備份可寫性或寫入前併發檢查。
+- 更新失敗或逾時留下的備份也能使用，不要求 `controlPlaneVerified: true`。先確認 Azure 更新已結束；若目前規則是部分或未知結果，需要人工確認後才使用強制回滾。policy 還在 `Updating` 或狀態未知時，不允許寫入。
+- 回滾前會先產生**目前狀態的新備份**，再重讀確認沒有競態變更，單次更新 custom rules、等待至多 600 秒並讀回驗證。原本作為來源的備份不會修改；必要時可用這份新備份復原回滾前的規則。
+- 回滾失敗不會自動再回滾或連鎖重試；保留新備份供排查。前述非原子併發限制同樣適用，請安排沒有其他寫入者的變更窗口。
+
+回滾完成後仍須等待邊緣設定傳播、驗證流量及 WAF 記錄，並重新評估移除緩解規則後的 PHP 暴露風險。
+
+## 人工選擇性還原
+
+若希望保留後續其他 custom rules 變更，而非還原完整快照，可使用以下人工程序，只移除本次新增的緩解規則。不要未經比對就將原始完整 policy 或 custom rules 覆寫回 Azure。此選擇性程序僅適用於**成功套用且 manifest 已驗證**的那一次新增緩解規則操作，不適用於獨立備份或回滾所產生的快照。
 
 1. 以該次 manifest 的 `resourceId` 核對同一個目標；確認沒有其他寫入者。
 2. 使用 `waf-policy show` 取得最新 policy 到 `latest-policy.json`，不要使用舊快照當作目前狀態。

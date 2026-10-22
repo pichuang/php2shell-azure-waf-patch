@@ -5,6 +5,9 @@ umask 077
 usage() {
     printf '%s\n' \
         '用法: mitigate-php2shell.sh --subscription NAME_OR_ID --resource-group RG --policy-name POLICY [--dry-run | --apply] [--backup-dir DIR]' \
+        '獨立備份: 同一組目標參數加 --backup-only，可搭配 --backup-dir DIR；不寫入 Azure。' \
+        '回滾預覽: 同一組目標參數加 --rollback BACKUP_DIR；加 --apply 才還原完整 custom rules。' \
+        '回滾遇到備份後的其他 custom rules 變更時停止；--force-rollback 明確允許覆寫這些變更。' \
         '預設僅預覽；--apply 才修改既有 PHP 專用 Front Door WAF policy。' \
         'priority 固定為 500/501/502，動作為 Block/Log/Log。不修改 policy 綁定或全域設定。' \
         '套用前請確認此 policy 僅涵蓋受影響的 PHP 網域及路由，且變更期間沒有其他寫入者。'
@@ -18,6 +21,9 @@ resource_group=''
 policy_name=''
 mode='dry-run'
 mode_selected=''
+operation='mitigate'
+rollback_source=''
+force_rollback=0
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 backup_root="$script_dir/backups"
 backup_path=''
@@ -25,13 +31,14 @@ backup_path=''
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h) usage; exit 0 ;;
-        --subscription|--resource-group|--policy-name|--backup-dir)
+        --subscription|--resource-group|--policy-name|--backup-dir|--rollback)
             [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 缺少值"
             case "$1" in
                 --subscription) subscription=$2 ;;
                 --resource-group) resource_group=$2 ;;
                 --policy-name) policy_name=$2 ;;
                 --backup-dir) backup_root=$2 ;;
+                --rollback) rollback_source=$2 ;;
             esac
             shift 2 ;;
         --dry-run|--apply)
@@ -39,9 +46,17 @@ while [[ $# -gt 0 ]]; do
             mode_selected=$1
             mode=${1#--}
             shift ;;
+        --backup-only) operation='backup'; shift ;;
+        --force-rollback) force_rollback=1; shift ;;
         *) die "未知參數: $1" ;;
     esac
 done
+if [[ -n "$rollback_source" ]]; then
+    [[ "$operation" != backup ]] || die '--backup-only 與 --rollback 不可同時使用'
+    operation='rollback'
+fi
+[[ "$force_rollback" == 0 || "$operation" == rollback ]] || die '--force-rollback 僅可搭配 --rollback'
+[[ "$operation" != backup || -z "$mode_selected" ]] || die '--backup-only 不可與 --dry-run 或 --apply 同時使用'
 [[ -n "$subscription" && -n "$resource_group" && -n "$policy_name" ]] || { usage >&2; die '請提供三個目標參數'; }
 for dependency in az jq; do
     command -v "$dependency" >/dev/null 2>&1 || die "缺少必要工具: $dependency"
@@ -67,6 +82,19 @@ get_policy() {
     az network front-door waf-policy show "${target[@]}" --output json > "$1" || die '無法讀取 WAF policy；請確認目標、登入與讀取權限'
 }
 
+persist_backup() {
+    mkdir -p -- "$backup_root" || die '無法建立備份根目錄'
+    backup_path=$(mktemp -d "$backup_root/php2shell-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") || die '無法建立備份目錄'
+    cp "$work_dir/before.json" "$backup_path/original-policy.json"
+    jq '(.customRules // {rules: []}) | .rules = (.rules // [])' "$work_dir/before.json" > "$backup_path/original-custom-rules.json"
+    cp "$work_dir/merged.json" "$backup_path/merged-custom-rules.json"
+    jq '.added' "$work_dir/plan.json" > "$backup_path/added-rules.json"
+    jq -n --arg id "$(jq -r .id "$work_dir/before.json")" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg operation "$operation" --arg source "$rollback_source" \
+        '{resourceId: $id, createdAt: $time, operation: $operation, rollbackSource: $source, controlPlaneVerified: false}' > "$backup_path/manifest.json"
+    printf '備份: %s\n' "$backup_path"
+}
+
 normalizers='
 def clean: walk(if type == "object" then with_entries(select(.value != null)) else . end);
 def rule:
@@ -87,6 +115,28 @@ def custom: (. // {rules: []}) | .rules = ((.rules // []) | map(rule) | sort_by(
 def stable: del(.customRules, .etag, .provisioningState, .resourceState, .systemData) | clean;
 '
 
+apply_custom_rules() {
+    persist_backup
+    get_policy "$work_dir/recheck.json"
+    jq -e --slurpfile before "$work_dir/before.json" '. == $before[0]' "$work_dir/recheck.json" >/dev/null \
+        || die '備份後 policy 已變動；請重新預覽，不會覆寫其他變更'
+    if ! az network front-door waf-policy update "${target[@]}" \
+        --custom-rules "@$work_dir/merged.json" --no-wait --output none; then
+        die "更新失敗或結果不確定；不自動回滾。請檢查 Azure 與備份: $backup_path"
+    fi
+    if ! az network front-door waf-policy wait "${target[@]}" --updated --interval 10 --timeout 600; then
+        die "等待失敗或逾時；更新可能仍在進行。請檢查 Azure 與備份: $backup_path"
+    fi
+    get_policy "$backup_path/verified-after.json"
+    jq -e --slurpfile before "$work_dir/before.json" --slurpfile merged "$work_dir/merged.json" "$normalizers"'
+        .provisioningState == "Succeeded"
+        and ((.customRules | custom) == ($merged[0] | custom))
+        and ((. | stable) == ($before[0] | stable))
+    ' "$backup_path/verified-after.json" >/dev/null || die "讀回驗證不符；不自動回滾。請檢查備份: $backup_path"
+    jq '.controlPlaneVerified = true' "$backup_path/manifest.json" > "$work_dir/verified-manifest.json"
+    mv "$work_dir/verified-manifest.json" "$backup_path/manifest.json"
+}
+
 get_policy "$work_dir/before.json"
 expected_id="/subscriptions/$subscription/resourceGroups/$resource_group/providers/Microsoft.Network/frontdoorWebApplicationFirewallPolicies/$policy_name"
 jq -e --arg id "$expected_id" '
@@ -97,6 +147,67 @@ jq -e --arg id "$expected_id" '
 ' "$work_dir/before.json" >/dev/null || die 'policy ID、SKU 或回應結構不符預期'
 printf '目標: %s\n' "$(jq -r '.id' "$work_dir/before.json")"
 jq '{sku: .sku.name, provisioningState, policySettings, frontendEndpointLinks, securityPolicyLinks}' "$work_dir/before.json"
+
+if [[ "$operation" == backup ]]; then
+    jq '(.customRules // {rules: []}) | .rules = (.rules // [])' "$work_dir/before.json" > "$work_dir/merged.json"
+    printf '{"added":[]}\n' > "$work_dir/plan.json"
+    persist_backup
+    printf '既有 custom rules 備份完成，未寫入 Azure。\n'
+    exit 0
+fi
+
+if [[ "$operation" == rollback ]]; then
+    for filename in manifest.json original-policy.json original-custom-rules.json merged-custom-rules.json; do
+        [[ -f "$rollback_source/$filename" ]] || die "回滾備份缺少檔案: $filename"
+        cp -- "$rollback_source/$filename" "$work_dir/rollback-$filename" || die "無法讀取回滾備份: $filename"
+    done
+    jq -e --slurpfile manifest "$work_dir/rollback-manifest.json" \
+        --slurpfile original "$work_dir/rollback-original-policy.json" \
+        --slurpfile before "$work_dir/before.json" "$normalizers"'
+        ($manifest | length == 1) and ($original | length == 1)
+        and (. | type == "object") and (.rules | type == "array")
+        and (($manifest[0].resourceId | ascii_downcase) == ($before[0].id | ascii_downcase))
+        and (($original[0].id | ascii_downcase) == ($before[0].id | ascii_downcase))
+        and ($original[0].sku.name == $before[0].sku.name)
+        and ((. | custom) == ($original[0].customRules | custom))
+        and all(.rules[]; (.name | type == "string" and length > 0)
+            and (.priority | type == "number" and . > 0 and floor == .)
+            and (.ruleType | IN("MatchRule", "RateLimitRule"))
+            and (.action | type == "string" and length > 0)
+            and (.matchConditions | type == "array"))
+        and (.rules | group_by(.name | ascii_downcase) | all(.[]; length == 1))
+        and (.rules | group_by(.priority) | all(.[]; length == 1))
+    ' "$work_dir/rollback-original-custom-rules.json" >/dev/null || die '回滾備份損壞、內容不一致、SKU 或目標 policy 不符'
+    jq -e 'type == "object" and (.rules | type == "array")' "$work_dir/rollback-merged-custom-rules.json" >/dev/null \
+        || die '回滾備份的預期規則格式不符'
+    cp "$work_dir/rollback-original-custom-rules.json" "$work_dir/merged.json"
+    printf '{"added":[]}\n' > "$work_dir/plan.json"
+    printf '回滾來源: %s\n回滾將還原以下完整 custom rules（其餘 policy 設定維持目前值）:\n' "$rollback_source"
+    jq . "$work_dir/merged.json"
+    if [[ "$mode" == apply ]]; then
+        jq -e '.provisioningState | IN("Succeeded", "Failed")' "$work_dir/before.json" >/dev/null \
+            || die 'policy 尚在更新或狀態未知，請等待完成後再回滾'
+    fi
+    if jq -e --slurpfile original "$work_dir/merged.json" "$normalizers"'
+        (.customRules | custom) == ($original[0] | custom)
+    ' "$work_dir/before.json" >/dev/null; then
+        printf '目前 custom rules 已與備份相同，無需回滾。\n'
+        exit 0
+    fi
+    if ! jq -e --slurpfile expected "$work_dir/rollback-merged-custom-rules.json" "$normalizers"'
+        (.customRules | custom) == ($expected[0] | custom)
+    ' "$work_dir/before.json" >/dev/null; then
+        [[ "$force_rollback" == 1 ]] || die 'custom rules 已有其他變更；確認要捨棄這些變更後，才加 --force-rollback'
+        warn '--force-rollback：將覆寫備份之後的 custom rules 變更'
+    fi
+    if [[ "$mode" == dry-run ]]; then
+        printf '回滾僅預覽，未寫入 Azure；加 --apply 才執行。\n'
+        exit 0
+    fi
+    apply_custom_rules
+    printf '回滾完成，完整 custom rules 已還原並通過讀回驗證；其餘 policy 設定未變更。\n'
+    exit 0
+fi
 
 desired="$script_dir/php2shell-rules.json"
 jq -e '
@@ -176,32 +287,5 @@ if jq -e '.added | length == 0' "$work_dir/plan.json" >/dev/null; then
     exit 0
 fi
 
-mkdir -p -- "$backup_root" || die '無法建立備份根目錄'
-backup_path=$(mktemp -d "$backup_root/php2shell-$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") || die '無法建立備份目錄'
-cp "$work_dir/before.json" "$backup_path/original-policy.json"
-jq '.customRules // {rules: []}' "$work_dir/before.json" > "$backup_path/original-custom-rules.json"
-cp "$work_dir/merged.json" "$backup_path/merged-custom-rules.json"
-jq '.added' "$work_dir/plan.json" > "$backup_path/added-rules.json"
-jq -n --arg id "$(jq -r .id "$work_dir/before.json")" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{resourceId: $id, createdAt: $time, controlPlaneVerified: false}' > "$backup_path/manifest.json"
-printf '備份: %s\n' "$backup_path"
-
-get_policy "$work_dir/recheck.json"
-jq -e --slurpfile before "$work_dir/before.json" '. == $before[0]' "$work_dir/recheck.json" >/dev/null \
-    || die '備份後 policy 已變動；請重新預覽，不會覆寫其他變更'
-if ! az network front-door waf-policy update "${target[@]}" \
-    --custom-rules "@$work_dir/merged.json" --no-wait --output none; then
-    die "更新失敗或結果不確定；不自動回滾。請檢查 Azure 與備份: $backup_path"
-fi
-if ! az network front-door waf-policy wait "${target[@]}" --updated --interval 10 --timeout 600; then
-    die "等待失敗或逾時；更新可能仍在進行。請檢查 Azure 與備份: $backup_path"
-fi
-get_policy "$backup_path/verified-after.json"
-jq -e --slurpfile before "$work_dir/before.json" --slurpfile merged "$work_dir/merged.json" "$normalizers"'
-    .provisioningState == "Succeeded"
-    and ((.customRules | custom) == ($merged[0] | custom))
-    and ((. | stable) == ($before[0] | stable))
-' "$backup_path/verified-after.json" >/dev/null || die "讀回驗證不符；不自動回滾。請檢查備份: $backup_path"
-jq '.controlPlaneVerified = true' "$backup_path/manifest.json" > "$work_dir/verified-manifest.json"
-mv "$work_dir/verified-manifest.json" "$backup_path/manifest.json"
+apply_custom_rules
 printf '控制平面更新與讀回驗證完成。尚須驗證實際流量與 WAF 記錄；Log 規則不阻擋請求。\n'
