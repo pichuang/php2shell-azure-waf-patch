@@ -1,0 +1,75 @@
+{
+  "rules": [
+    {
+      "name": "BlockPhpSessionUploadProgress",
+      "priority": 500,
+      "enabledState": "Enabled",
+      "ruleType": "MatchRule",
+      "action": "Block",
+      "matchConditions": [
+        {
+          "matchVariable": "RequestHeader",
+          "selector": "Content-Type",
+          "operator": "Contains",
+          "negateCondition": false,
+          "transforms": ["Lowercase"],
+          "matchValue": ["multipart/form-data"]
+        },
+        {
+          "matchVariable": "RequestBody",
+          "operator": "Contains",
+          "negateCondition": false,
+          "transforms": ["Lowercase"],
+          "matchValue": ["php_session_upload_progress"]
+        }
+      ]
+    },
+    {
+      "name": "PhpFormNesting20",
+      "priority": 501,
+      "enabledState": "Enabled",
+      "ruleType": "MatchRule",
+      "action": "Log",
+      "matchConditions": [
+        {
+          "matchVariable": "RequestHeader",
+          "selector": "Content-Type",
+          "operator": "BeginsWith",
+          "negateCondition": false,
+          "transforms": ["Trim", "Lowercase"],
+          "matchValue": ["application/x-www-form-urlencoded"]
+        },
+        {
+          "matchVariable": "RequestBody",
+          "operator": "RegEx",
+          "negateCondition": false,
+          "transforms": ["UrlDecode"],
+          "matchValue": ["(?:^|&)[^&=\\[]+(?:\\[[^&=\\]]*\\]){20}"]
+        }
+      ]
+    },
+    {
+      "name": "PhpMultipartNesting20",
+      "priority": 502,
+      "enabledState": "Enabled",
+      "ruleType": "MatchRule",
+      "action": "Log",
+      "matchConditions": [
+        {
+          "matchVariable": "RequestHeader",
+          "selector": "Content-Type",
+          "operator": "BeginsWith",
+          "negateCondition": false,
+          "transforms": ["Trim", "Lowercase"],
+          "matchValue": ["multipart/form-data"]
+        },
+        {
+          "matchVariable": "RequestBody",
+          "operator": "RegEx",
+          "negateCondition": false,
+          "matchValue": ["(?i)(?:^|\\r?\\n)content-disposition:[ \\t]*form-data[^\\r\\n]*;[ \\t]*name[ \\t]*=[ \\t]*(?:\"(?:\\\\[\"\\\\]|[^\"\\r\\n\\[])+(?:\\[(?:\\\\[\"\\\\]|[^\"\\r\\n\\]])*\\]){20}|[^ \\t\\r\\n;\"\\[]+(?:\\[[^ \\t\\r\\n;\"\\]]*\\]){20})"]
+        }
+      ]
+    }
+  ]
+}
