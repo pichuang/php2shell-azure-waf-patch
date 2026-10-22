@@ -60,6 +60,22 @@ chmod +x mitigate-php2shell.sh tests/test-mitigate-php2shell.sh
 
 可用 `--backup-dir '/secure/path'` 改變備份根目錄；預設位於腳本旁的 `backups/`。目錄直接以 `policy_name` 分組，每次執行再建立獨立目錄，例如 `backups/php-policy/php2shell-TIMESTAMP.SUFFIX/`；重跑不會覆寫舊備份，自訂根目錄也使用相同分組方式。備份可能含敏感的既有規則與設定，請妥善管理；自訂備份路徑不會自動加入 Git 忽略清單。`--help` 不需要 Azure 登入。
 
+### 強制套用
+
+確認風險後，使用 `--force --apply` 略過套用前置警告，包含 Disabled、Detection、非 Succeeded（含 Updating／Failed／未知狀態）、缺少綁定與較早的 Allow：
+
+```bash
+./mitigate-php2shell.sh \
+	--subscription '<subscription-name-or-id>' \
+	--resource-group '<resource-group>' \
+	--policy-name '<existing-php-waf-policy>' \
+	--force --apply
+```
+
+警告仍會列出，不需互動確認；`--force` 單獨使用或搭配 `--dry-run` 仍只預覽，不寫入。備份 manifest 的 `force` 欄位記錄是否指定此參數。`--force` 只適用新增緩解規則，不能搭配 `--backup-only` 或 `--rollback`；回滾覆寫後續變更仍使用 `--force-rollback`。
+
+**強制寫入不代表緩解生效：**腳本不會啟用 policy、改為 Prevention、建立綁定或移除 Allow；Azure 仍可能拒絕正在更新或其他不合法狀態的更新。登入與目標／SKU 驗證、規則格式、同名／priority 衝突、配額、備份、寫入前漂移與寫入後驗證均不可略過。服務失敗仍以非零狀態結束，不自動回滾。
+
 ### 更新保護
 
 - 保留所有非目標 custom rules、managed rules、tags、SKU 與其餘 policy settings；不修改 `requestBodyCheck`。
@@ -67,7 +83,7 @@ chmod +x mitigate-php2shell.sh tests/test-mitigate-php2shell.sh
 - 同名不同內容立即停止，包含已由操作人員將 Log 提升為 Block 的情況，不會降回 Log。名稱大小寫碰撞亦停止。
 - priority 500、501、502 被其他規則占用即停止，不自動換號或重排。
 - 檢查名稱、priority 重複、100 條 custom rules、每條 10 個條件；Standard／Premium 另檢查最多 5 條含 Regex 的 custom rules，本次新增最多占 2 條。Classic 不套用此 5 條限制，仍須遵守服務實際配額。
-- 較早且已啟用的 Allow 可能略過後續規則，因此阻止套用；較早的其他終止動作列出條件供審查，不自動修改。
+- 較早且已啟用的 Allow 可能略過後續規則，因此預設阻止套用，可用 `--force` 略過；較早的其他終止動作列出條件供審查，不自動修改。
 - 先持久備份，再重讀 policy；任何內容或 etag 漂移都中止。備份失敗時不寫入 Azure。
 - 單次 `waf-policy update --custom-rules @file` 寫入完整合併結果，不會逐條建立只有 header 條件的暫態 Block 規則。
 - 以 `wait --updated --timeout 600` 有限等待，之後讀回比對規則及非目標設定。這是控制平面驗證，不代表各邊緣節點已傳播完成。

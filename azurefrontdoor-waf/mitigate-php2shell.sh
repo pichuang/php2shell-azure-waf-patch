@@ -4,8 +4,9 @@ umask 077
 
 usage() {
     printf '%s\n' \
-        '用法: mitigate-php2shell.sh --subscription NAME_OR_ID --resource-group RG --policy-name POLICY [--dry-run | --apply] [--backup-dir DIR]' \
+        '用法: mitigate-php2shell.sh --subscription NAME_OR_ID --resource-group RG --policy-name POLICY [--dry-run | --apply] [--force] [--backup-dir DIR]' \
         '獨立備份: 同一組目標參數加 --backup-only，可搭配 --backup-dir DIR；不寫入 Azure。' \
+        '--force 略過套用前置警告（狀態、綁定、較早 Allow），仍需 --apply 才寫入；不略過備份、衝突或漂移保護。' \
         '回滾預覽: 同一組目標參數加 --rollback BACKUP_DIR；加 --apply 才還原完整 custom rules。' \
         '回滾遇到備份後的其他 custom rules 變更時停止；--force-rollback 明確允許覆寫這些變更。' \
         '預設僅預覽並備份；--apply 才修改既有 PHP 專用 Front Door WAF policy。' \
@@ -25,6 +26,7 @@ mode_selected=''
 operation='mitigate'
 rollback_source=''
 force_rollback=0
+force=0
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 backup_root="$script_dir/backups"
 backup_path=''
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
             mode=${1#--}
             shift ;;
         --backup-only) operation='backup'; shift ;;
+        --force) force=1; shift ;;
         --force-rollback) force_rollback=1; shift ;;
         *) die "未知參數: $1" ;;
     esac
@@ -57,6 +60,7 @@ if [[ -n "$rollback_source" ]]; then
     operation='rollback'
 fi
 [[ "$force_rollback" == 0 || "$operation" == rollback ]] || die '--force-rollback 僅可搭配 --rollback'
+[[ "$force" == 0 || "$operation" == mitigate ]] || die '--force 僅可用於新增緩解規則，不可搭配 --backup-only 或 --rollback；回滾請使用 --force-rollback'
 [[ "$operation" != backup || -z "$mode_selected" ]] || die '--backup-only 不可與 --dry-run 或 --apply 同時使用'
 [[ -n "$subscription" && -n "$resource_group" && -n "$policy_name" ]] || { usage >&2; die '請提供三個目標參數'; }
 [[ "$policy_name" != */* && "$policy_name" != *\\* && "$policy_name" != . && "$policy_name" != .. ]] \
@@ -98,8 +102,8 @@ persist_backup() {
     jq '(.customRules // {rules: []}) | .rules = (.rules // [])' "$work_dir/before.json" > "$backup_path/original-custom-rules.json"
     save_backup_plan
     jq -n --arg id "$(jq -r .id "$work_dir/before.json")" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --arg operation "$operation" --arg source "$rollback_source" --arg mode "$mode" \
-        '{resourceId: $id, createdAt: $time, operation: $operation, mode: $mode, rollbackSource: $source, controlPlaneVerified: false}' > "$backup_path/manifest.json"
+        --arg operation "$operation" --arg source "$rollback_source" --arg mode "$mode" --argjson force "$force" \
+        '{resourceId: $id, createdAt: $time, operation: $operation, mode: $mode, force: ($force == 1), rollbackSource: $source, controlPlaneVerified: false}' > "$backup_path/manifest.json"
     printf '備份: %s\n' "$backup_path"
 }
 
@@ -293,6 +297,10 @@ if jq -e 'any(.[]; .action == "Allow")' "$work_dir/earlier.json" >/dev/null; the
     block_reasons+=("較早的 Allow 可略過後續緩解規則：$(jq -r '[.[] | select(.action == "Allow") | "\(.name) (priority=\(.priority))"] | join(", ")' "$work_dir/earlier.json")。要求沒有會先放行的已啟用 Allow 規則；請審查上列完整條件，由操作人員確認是否需調整範圍或優先順序，腳本不會修改既有規則。")
 fi
 blockers=${#block_reasons[@]}
+if [[ "$force" == 1 && "$blockers" != 0 ]]; then
+    warn "--force：略過 ${blockers} 項套用前置警告；不會調整模式、啟用狀態、綁定或既有 Allow，規則可能無法實際保護流量。"
+    printf '  - %s\n' "${block_reasons[@]}" >&2
+fi
 if [[ "$mode" == dry-run ]]; then
     printf '僅預覽，未寫入 Azure。套用阻礙: %s\n' "$blockers"
     if [[ "$blockers" != 0 ]]; then
@@ -300,7 +308,7 @@ if [[ "$mode" == dry-run ]]; then
     fi
     exit 0
 fi
-if [[ "$blockers" != 0 ]]; then
+if [[ "$blockers" != 0 && "$force" == 0 ]]; then
     die "$(printf '套用前置條件不符（%s 項），未寫入 Azure。原因與處理方向：\n' "$blockers"; printf '  - %s\n' "${block_reasons[@]}")"
 fi
 if jq -e '.added | length == 0' "$work_dir/plan.json" >/dev/null; then

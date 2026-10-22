@@ -444,6 +444,59 @@ for failure in update timeout verify unrelated; do
     jq -e '.operation != "rollback" or .controlPlaneVerified == false' "$MOCK_DIR"/backups/php-policy/*/manifest.json >/dev/null
 done
 
+new_case 'force 單獨使用仍僅預覽' '.policySettings.mode = "Detection"'
+check_run 0 0 '僅預覽' --force
+grep -Fq -- '--force：略過 1 項' "$MOCK_DIR/output"
+backup=$(find "$MOCK_DIR/backups" -name manifest.json -print)
+jq -e '.force == true and .mode == "dry-run" and .controlPlaneVerified == false' "$backup" >/dev/null
+case_name='force 明確 dry-run 仍零寫入'
+check_run 0 0 '僅預覽' --force --dry-run
+for filter in '.policySettings.mode = "Detection"' '.policySettings.enabledState = "Disabled"' \
+    '.securityPolicyLinks = []' '.provisioningState = "Updating"' \
+    '.customRules.rules = [($desired[0].rules[0] | .name = "AllowEarlier" | .priority = 100 | .action = "Allow")]'; do
+    new_case "force 略過單項前置警告: $filter" "$filter"
+    check_run 0 1 '--force：略過 1 項' --force --apply
+    jq -e '.force == true and .controlPlaneVerified == true' "$MOCK_DIR"/backups/php-policy/*/manifest.json >/dev/null
+done
+new_case 'force 同時略過五項警告' '.policySettings.mode = "Detection" | .policySettings.enabledState = "Disabled" | .provisioningState = "Failed" | .securityPolicyLinks = [] | .customRules.rules = [($desired[0].rules[0] | .name = "AllowEarlier" | .priority = 100 | .action = "Allow")]'
+check_run 0 1 '--force：略過 5 項' --apply --force
+for reason in 'policySettings.mode' 'policySettings.enabledState' 'provisioningState' '未發現 policy 綁定' '較早的 Allow'; do
+    grep -Fq "$reason" "$MOCK_DIR/output"
+done
+jq -e '.policySettings.mode == "Detection" and .policySettings.enabledState == "Disabled" and .securityPolicyLinks == [] and .customRules.rules[0].action == "Allow"' "$MOCK_DIR/policy.json" >/dev/null
+case_name='force 不破壞零寫入重跑'
+check_run 0 0 '無需更新' --force --apply
+new_case '無警告也可 force 套用'
+check_run 0 1 '讀回驗證完成' --force --apply
+new_case 'force 不略過同名衝突' '.customRules.rules = [($desired[0].rules[0] | .action = "Log")]'
+check_run 1 0 '同名規則內容不同' --force --apply
+new_case 'force 不略過 priority 衝突' '.customRules.rules = [($desired[0].rules[0] | .name = "Other")]'
+check_run 1 0 'priority 衝突' --force --apply
+new_case 'force 不略過 Regex 配額' '.customRules.rules = [range(1;5) as $index | $desired[0].rules[1] | .name = ("Regex" + ($index | tostring)) | .priority = $index]'
+check_run 1 0 '配額' --force --apply
+new_case 'force 不略過目標驗證' '.id = "/wrong"'
+check_run 1 0 '不符預期' --force --apply
+new_case 'force 不略過 SKU 驗證' '.sku.name = "Unknown"'
+check_run 1 0 '不符預期' --force --apply
+new_case 'force 不略過備份失敗'
+printf 'blocked\n' > "$MOCK_DIR/blocked"
+check_run 1 0 '備份' --force --apply --backup-dir "$MOCK_DIR/blocked/subdir"
+new_case 'force 不略過漂移'
+MOCK_FAILURE=drift
+check_run 1 0 'policy 已變動' --force --apply
+for failure in update timeout verify unrelated; do
+    new_case "force 不略過寫入後失敗: $failure"
+    MOCK_FAILURE=$failure
+    check_run 1 1 '備份' --force --apply
+    jq -e '.force == true and .controlPlaneVerified == false' "$MOCK_DIR"/backups/php-policy/*/manifest.json >/dev/null
+done
+new_case 'force 不可搭配備份'
+check_run 1 0 '--force 僅可用於' --force --backup-only
+new_case 'force 不可替代 force-rollback'
+check_run 1 0 '--force 僅可用於' --rollback /unused --force --apply
+new_case '反向順序亦拒絕 force 與回滾'
+check_run 1 0 '--force 僅可用於' --force --rollback /unused
+
 new_case '強制回滾旗標不可單獨使用'
 check_run 1 0 '僅可搭配' --force-rollback
 new_case '備份與回滾互斥'

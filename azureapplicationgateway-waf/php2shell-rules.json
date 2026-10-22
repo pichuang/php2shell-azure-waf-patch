@@ -1,0 +1,71 @@
+[
+  {
+    "name": "BlockPhpSessionUploadProgress",
+    "priority": 90,
+    "state": "Enabled",
+    "ruleType": "MatchRule",
+    "action": "Block",
+    "matchConditions": [
+      {
+        "matchVariables": [{"variableName": "RequestHeaders", "selector": "Content-Type"}],
+        "operator": "Contains",
+        "negationConditon": false,
+        "transforms": ["Lowercase"],
+        "matchValues": ["multipart/form-data"]
+      },
+      {
+        "matchVariables": [{"variableName": "PostArgs"}],
+        "operator": "Contains",
+        "negationConditon": false,
+        "transforms": ["Lowercase"],
+        "matchValues": ["php_session_upload_progress"]
+      }
+    ]
+  },
+  {
+    "name": "PhpFormNesting20",
+    "priority": 91,
+    "state": "Enabled",
+    "ruleType": "MatchRule",
+    "action": "Log",
+    "matchConditions": [
+      {
+        "matchVariables": [{"variableName": "RequestHeaders", "selector": "Content-Type"}],
+        "operator": "BeginsWith",
+        "negationConditon": false,
+        "transforms": ["Trim", "Lowercase"],
+        "matchValues": ["application/x-www-form-urlencoded"]
+      },
+      {
+        "matchVariables": [{"variableName": "RequestBody"}],
+        "operator": "Regex",
+        "negationConditon": false,
+        "transforms": ["UrlDecode"],
+        "matchValues": ["(?:^|&)[^&=\\[]+(?:\\[[^&=\\]]*\\]){20}"]
+      }
+    ]
+  },
+  {
+    "name": "PhpMultipartNesting20",
+    "priority": 92,
+    "state": "Enabled",
+    "ruleType": "MatchRule",
+    "action": "Log",
+    "matchConditions": [
+      {
+        "matchVariables": [{"variableName": "RequestHeaders", "selector": "Content-Type"}],
+        "operator": "BeginsWith",
+        "negationConditon": false,
+        "transforms": ["Trim", "Lowercase"],
+        "matchValues": ["multipart/form-data"]
+      },
+      {
+        "matchVariables": [{"variableName": "PostArgs"}],
+        "operator": "Regex",
+        "negationConditon": false,
+        "transforms": [],
+        "matchValues": ["^[^\\[\\]]+(?:\\[[^\\]]*\\]){20}"]
+      }
+    ]
+  }
+]
