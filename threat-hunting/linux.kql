@@ -1,5 +1,26 @@
-DeviceProcessEvents
-| where Timestamp > ago(30d)
-| where FileName matches regex @"^php(-fpm|-cgi)?[0-9.]*$"
-    or InitiatingProcessFileName matches regex @"^php(-fpm|-cgi)?[0-9.]*$"
-| summarize LastSeen=max(Timestamp), Paths=make_set(FolderPath), Cmd=make_set(ProcessCommandLine,5) by DeviceName
+let Lookback = 30d;
+let PhpProcess = @"^php(?:-fpm|-cgi)?(?:[0-9]+(?:\.[0-9]+)*)?(?:-fpm|-cgi)?(?::.*)?$";
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(Lookback)
+    | where FileName matches regex PhpProcess
+    | project Timestamp, DeviceId, DeviceName, Evidence = "PHP process",
+              PhpFileName = FileName, PhpPath = FolderPath,
+              PhpCommandLine = ProcessCommandLine,
+              ObservedVersion = ProcessVersionInfoProductVersion
+),
+(
+    union DeviceProcessEvents, DeviceFileEvents
+    | where Timestamp > ago(Lookback)
+    | where InitiatingProcessFileName matches regex PhpProcess
+    | project Timestamp, DeviceId, DeviceName, Evidence = "PHP initiated activity",
+              PhpFileName = InitiatingProcessFileName, PhpPath = InitiatingProcessFolderPath,
+              PhpCommandLine = InitiatingProcessCommandLine,
+              ObservedVersion = InitiatingProcessVersionInfoProductVersion
+)
+| summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Events = count(),
+            Evidence = make_set(Evidence, 10), ObservedVersions = make_set(ObservedVersion, 20),
+            CommandLines = make_set(PhpCommandLine, 20)
+    by DeviceId, DeviceName, PhpFileName, PhpPath
+| order by LastSeen desc

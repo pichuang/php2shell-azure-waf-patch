@@ -1,7 +1,38 @@
-DeviceProcessEvents
-| where DeviceName == "<機器名稱>"
-| where FileName has "php" or InitiatingProcessFileName has "php"
-| project Timestamp, FileName, FolderPath, ProcessCommandLine, SHA256,
-          ProcessVersionInfoProductVersion,
-          InitiatingProcessFileName, InitiatingProcessFolderPath, InitiatingProcessCommandLine
-| take 20
+let Lookback = 30d;
+let TargetDeviceName = "<機器完整名稱>";
+let PhpProcess = @"^php(?:-fpm|-cgi)?(?:[0-9]+(?:\.[0-9]+)*)?(?:-fpm|-cgi)?(?::.*)?$";
+let PhpExecutables = dynamic(["php.exe", "php-cgi.exe", "php-win.exe"]);
+let WebServers = dynamic(["w3wp.exe", "httpd.exe", "httpd", "apache2", "nginx", "nginx.exe"]);
+let ReviewExecutables = dynamic([
+    "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe",
+    "mshta.exe", "rundll32.exe", "certutil.exe", "bitsadmin.exe", "curl.exe",
+    "whoami.exe", "net.exe", "net1.exe", "schtasks.exe",
+    "sh", "bash", "dash", "ash", "zsh", "curl", "wget", "python", "python3",
+    "perl", "nc", "ncat", "netcat", "socat", "id", "whoami", "uname", "chmod", "crontab"
+]);
+union withsource=EventTable DeviceProcessEvents, DeviceFileEvents, DeviceNetworkEvents, DeviceImageLoadEvents
+| where Timestamp > ago(Lookback)
+| where DeviceName =~ TargetDeviceName
+| extend IsPhpProcess = FileName in~ (PhpExecutables) or FileName matches regex PhpProcess,
+         IsPhpInitiator = InitiatingProcessFileName in~ (PhpExecutables)
+             or InitiatingProcessFileName matches regex PhpProcess,
+         IsWebInitiator = InitiatingProcessFileName in~ (WebServers),
+         IsPhpModule = tolower(FileName) matches regex @"^php[578](ts|apache2_4)?\.dll$"
+| where IsPhpProcess or IsPhpInitiator or IsWebInitiator or IsPhpModule
+| extend Triage = case(
+    EventTable == "DeviceProcessEvents" and (IsPhpInitiator or IsWebInitiator)
+        and FileName in~ (ReviewExecutables), "優先調查：PHP／Web 衍生 shell 或工具",
+    EventTable == "DeviceFileEvents" and (IsPhpInitiator or IsWebInitiator)
+        and tolower(FileName) matches regex @"\.(?:php[0-9]?|phtml|phar|exe|dll|ps1|bat|cmd|sh)$",
+        "優先調查：PHP／Web 寫入、修改或刪除腳本／可執行檔",
+    EventTable == "DeviceNetworkEvents", "檢視網路活動：不代表惡意連線",
+    IsPhpModule, "PHP 模組檔案或載入跡象",
+    IsWebInitiator and not(IsPhpInitiator), "Web 活動：尚未證實使用 PHP",
+    "PHP 活動：需結合上下文")
+| project Timestamp, DeviceId, DeviceName, ReportId, EventTable, ActionType, Triage,
+          FileName, FolderPath, ProcessCommandLine, ProcessVersionInfoProductVersion,
+          SHA1, SHA256, InitiatingProcessFileName, InitiatingProcessId,
+          InitiatingProcessCreationTime, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine, InitiatingProcessVersionInfoProductVersion,
+          InitiatingProcessParentFileName, RemoteIP, RemotePort, RemoteUrl
+| top 1000 by Timestamp desc

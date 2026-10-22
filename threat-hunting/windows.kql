@@ -1,4 +1,50 @@
-union DeviceProcessEvents, DeviceFileEvents
-| where Timestamp > ago(30d)
-| where FileName in~ ("php.exe","php-cgi.exe","php8ts.dll","php7ts.dll") or InitiatingProcessFileName in~ ("php.exe","php-cgi.exe")
-| summarize LastSeen=max(Timestamp), Paths=make_set(FolderPath) by DeviceName
+let Lookback = 30d;
+let PhpExecutables = dynamic(["php.exe", "php-cgi.exe", "php-win.exe"]);
+let PhpModules = @"^php[578](ts|apache2_4)?\.dll$";
+union
+(
+	DeviceProcessEvents
+	| where Timestamp > ago(Lookback)
+	| where FileName in~ (PhpExecutables)
+	| project Timestamp, DeviceId, DeviceName, Evidence = "PHP process",
+			  PhpFileName = FileName, PhpPath = FolderPath,
+			  ObservedVersion = ProcessVersionInfoProductVersion
+),
+(
+	union DeviceProcessEvents, DeviceFileEvents
+	| where Timestamp > ago(Lookback)
+	| where InitiatingProcessFileName in~ (PhpExecutables)
+	| project Timestamp, DeviceId, DeviceName, Evidence = "PHP initiated activity",
+			  PhpFileName = InitiatingProcessFileName, PhpPath = InitiatingProcessFolderPath,
+			  ObservedVersion = InitiatingProcessVersionInfoProductVersion
+),
+(
+	DeviceFileEvents
+	| where Timestamp > ago(Lookback)
+	| where FileName in~ (PhpExecutables) or tolower(FileName) matches regex PhpModules
+	| project Timestamp, DeviceId, DeviceName, Evidence = "PHP file activity",
+			  PhpFileName = FileName, PhpPath = FolderPath, ObservedVersion = ""
+),
+(
+	DeviceImageLoadEvents
+	| where Timestamp > ago(Lookback)
+	| where tolower(FileName) matches regex PhpModules
+	| project Timestamp, DeviceId, DeviceName, Evidence = "PHP DLL loaded",
+			  PhpFileName = FileName, PhpPath = FolderPath, ObservedVersion = ""
+)
+| extend PhpVersion = extract(@"^(\d+\.\d+\.\d+)(?:\.\d+)?$", 1, ObservedVersion)
+| extend ParsedVersion = parse_version(PhpVersion)
+| extend VersionAssessment = case(
+	isnull(ParsedVersion), "版本未知，需人工確認",
+	ParsedVersion >= parse_version("5.4.0") and ParsedVersion < parse_version("8.2.0"), "公告列為 EOL，需遷移",
+	PhpVersion startswith "8.2." and ParsedVersion < parse_version("8.2.35"), "低於公告修補門檻",
+	PhpVersion startswith "8.3." and ParsedVersion < parse_version("8.3.36"), "低於公告修補門檻",
+	PhpVersion startswith "8.4." and ParsedVersion < parse_version("8.4.27"), "低於公告修補門檻",
+	PhpVersion startswith "8.5." and ParsedVersion < parse_version("8.5.12"), "低於公告修補門檻",
+	PhpVersion startswith "8.2." or PhpVersion startswith "8.3."
+		or PhpVersion startswith "8.4." or PhpVersion startswith "8.5.", "達公告版本門檻，仍須確認修補狀態",
+	"公告範圍外，需人工確認")
+| summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Events = count(),
+			Evidence = make_set(Evidence, 10)
+	by DeviceId, DeviceName, PhpFileName, PhpPath, ObservedVersion, VersionAssessment
+| order by LastSeen desc
