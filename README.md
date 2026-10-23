@@ -1,36 +1,53 @@
-# PHP Vulnerabilities: Azure WAF Mitigation Runbook
+# Azure Front Door and Application Gateway: PHP WAF Mitigation Runbook
+
+## TL;DR
+
+> **Back up the existing WAF configuration before any deployment or change.** Follow [Shared Preparation](#shared-preparation) to export the policy, preserving custom rules, managed-rule overrides, and policy settings. If changing Application Gateway response rewrites, also back up the gateway's rewrite sets and route bindings. Continue only after confirming that the backups are complete and readable and a rollback plan is ready; do not deploy if backup fails or is incomplete.
+
+1. **Apply temporary protection for your platform:** Use the Azure CLI steps for [Front Door](#azure-front-door-waf) or [Application Gateway](#azure-application-gateway-waf_v2), preserve existing rules, and confirm PHP route scope, Enabled/Prevention state, and earlier Allow rules. Apply the upload-progress baseline and assess platform-specific size limits and response protection; keep nesting rules in Log initially.
+2. **Consider emergency containment if PHP cannot be changed immediately:** If the vulnerable CVE-2026-115560 configuration cannot be excluded, temporarily block multipart across the affected PHP scope after approval. This interrupts legitimate uploads and multipart forms and does not fully remediate all three vulnerabilities.
+3. **Validate in staging before production deployment:** Follow [Data-Plane Validation](#data-plane-validation) to verify request blocking, response behavior, login/upload impact, and rehearse [component rollback](#rollback-by-component). Successful configuration readback does not prove enforcement; Front Door response rule 99006001 provides no WAF logs or hit counts.
+4. **Pursue PHP remediation in parallel:** WAF is temporary containment. Have the runtime owner confirm the applicable fix or mitigation for each CVE and update every serving runtime and container image; do not assume releases fixing the first two vulnerabilities also fix CVE-2026-115560.
+
+## What Happened
+
+Use the block's copy button to paste this update into Teams or another messaging app.
+
+```text
+[PHP2Shell risk and recommended response | Information reviewed: 2026-10-24]
+
+What happened?
+PHP announced three related vulnerabilities (CVE-2026-109618, CVE-2026-109619, and CVE-2026-115560). In plain terms, under specific conditions, PHP can mishandle memory exhaustion, data left behind by a previous request, or upload-progress and session data. An attacker who meets the relevant conditions could crash the website service or potentially execute unauthorized code on the server. Not every PHP website meets the same conditions; versions, settings, and application behavior still need assessment. This notice does not establish that we have been compromised.
+
+Recommended actions:
+1. Before any deployment, back up the existing Azure WAF configuration, confirm the backup is complete and readable, and prepare a rollback plan. If changing Application Gateway response rewrites, also back up rewrite rules and route bindings. Do not deploy if backup fails.
+2. In parallel, have system owners inventory PHP versions, settings, and container images, confirm the applicable fix or mitigation for each vulnerability, and schedule updates. Do not assume versions fixing the first two vulnerabilities also fix CVE-2026-115560.
+3. Add temporary protection through Azure Front Door or Application Gateway WAF, preserve existing rules, confirm coverage of the affected PHP routes, and restrict direct origin access that bypasses WAF. Configure size limits and response protection according to platform capabilities and availability.
+4. If PHP cannot be changed immediately and the vulnerable CVE-2026-115560 configuration cannot be excluded, consider an approved temporary block on multipart requests, commonly used for file uploads, across affected PHP routes. This interrupts legitimate uploads and some forms; assess business impact first.
+5. Verify blocking, login/upload impact, and rollback in staging before production deployment. Successful configuration does not prove enforcement. WAF reduces risk but does not replace PHP remediation or guarantee protection against every exploitation path.
+
+Please have the responsible owners report affected sites and versions, backup and validation results, the planned change window, upload interruption impact, remediation owners, and deadlines. Mark unconfirmed items as pending; do not report planned controls as completed.
+```
 
 Advisory review date: **2026-10-24**.
 
-This runbook separates recommendations for CVE-2026-109618, CVE-2026-109619, and CVE-2026-115560. Azure WAF provides temporary compensating controls, not a PHP vulnerability fix. The existing rule definitions and deployment scripts remain unchanged.
+Start with the platform you operate. The primary workflow uses Azure CLI directly for CVE-2026-109618, CVE-2026-109619, and CVE-2026-115560; repository scripts are an optional alternative at the end. Azure WAF provides temporary compensating controls, not a PHP vulnerability fix. The existing rule definitions and deployment scripts remain unchanged. Run only the commands for your platform; if both products protect the application, configure and validate each layer independently.
 
-## Choose a Response
+## Recommended Configuration
 
-| Vulnerability | Relevant behavior | Recommended WAF response | Remaining risk |
-| --- | --- | --- | --- |
-| CVE-2026-109618 | Out-of-memory handling leaves partially initialized request state unsafe during cleanup. | Enforce conservative request/upload limits; optionally block multipart where it is unnecessary. Treat nesting rules as supplementary controls. | Small requests, multipart expansion, and application-specific allocations can still exhaust memory. Upgrade PHP. |
-| CVE-2026-109619 | Request-owned state survives into a later request handled by the same worker. | Restrict the session upload-progress entry point using the existing baseline; optionally block multipart entirely. | Other stale-state producers and consumers are not covered. Upgrade PHP. |
-| CVE-2026-115560 | Upload progress is enabled, the configured serializer is `php_binary` or `php_serialize`, and application code switches it to `php` before `session_start()`. | If PHP configuration cannot be changed, temporarily block multipart requests across the affected PHP scope. | WAF cannot establish the server-side prerequisites; alternate ingress and parsing differences must be addressed. Track the dedicated PHP fix. |
-
-**Patch status:** PHP 8.2.35, 8.3.36, 8.4.27, and 8.5.12 contain fixes for CVE-2026-109618 and CVE-2026-109619. Use these or later supported patched releases, or verified vendor backports. Do not assume those releases also fix CVE-2026-115560: the October 23 notice says its full advisory will accompany the next regular bugfix release.
-
-## Source Interpretation and Coverage
-
-The [Microsoft upgrade and Azure WAF guidance](https://techcommunity.microsoft.com/blog/azurenetworksecurityblog/addressing-php2shell-cve-2026-109618-and-cve-2026-109619-upgrade-guidance-and-az/4566623) calls for **request-side and response-side controls**, not just the three custom rules. Its October 22 revision supplies the cookie rewrite expression used below. PHP advisories remain authoritative for affected configurations and remediation.
-
-The third-party [ikow/php2shell-poc repository](https://github.com/ikow/php2shell-poc/tree/31519e6d8a84dee1df1262961ed1bebb65accadd) is used as a test-design reference, pinned to commit `31519e6d8a84dee1df1262961ed1bebb65accadd`. Its chain names, reliability claims, and scanner results are research observations, not Azure protection guarantees or a one-to-one mapping to CVEs. Its serializer-mismatch chain is not proof of the precise CVE-2026-115560 runtime-switch prerequisite. Do not copy its ModSecurity rules directly into an Azure policy.
-
-| Source observation | Operational consequence | What a passing WAF check does not prove |
+| Vulnerability | Azure Front Door WAF | Application Gateway WAF_v2 |
 | --- | --- | --- |
-| Chains A/C use upload progress and require additional application/configuration conditions. | Test the default and actual configured progress field names; include filename-bearing multipart controls. | Blocking a marker does not establish that all injection or deserialization paths are closed. |
-| Chain B requires attacker-controlled deserialization. | Keep patching and application review separate from upload controls. | A multipart block does not protect arbitrary application `unserialize()` calls. |
-| Chain D concerns OOM during mod_php request startup. | Test size enforcement and supported framing without causing OOM; do not restrict mitigation to named upload routes. | A small accepted request or a rejected large request does not demonstrate memory safety. |
-| Chain E describes a session-dependent producer followed by an early consumer on another PHP endpoint. | Cover all affected PHP routes, including extensionless and no-session endpoints; correlate worker failures separately. | A single-request test cannot reproduce or exclude cross-request worker-state exploitation. |
-| Detection examples inspect filenames, response errors, and chunked framing. | Use supported Azure match variables, origin telemetry, and safe fixtures; verify framing after proxy normalization. | Absence of a visible `Transfer-Encoding` header or an error string is not proof of safety. |
+| CVE-2026-109618 | Block multipart where the upload interruption is acceptable; otherwise require upstream/origin limits before PHP parsing. Front Door's 128 KB inspection depth is not a total request-size enforcement setting. | Enable request-body inspection, non-file body-size enforcement, and file-upload enforcement with approved conservative limits. Block multipart when stronger containment is needed. |
+| CVE-2026-109619 | Apply the upload-progress baseline; use a separate multipart Block for stronger containment. Add managed response rule `99006001` when available. | Apply the upload-progress baseline; use a separate multipart Block for stronger containment. Add the conditional response-cookie rewrite. |
+| CVE-2026-115560 | If runtime mitigation cannot be applied and the vulnerable configuration cannot be excluded, temporarily Block multipart across the affected PHP routes. | Same: temporarily Block multipart across the affected PHP routes. |
 
-Do not execute the repository's exploit or vulnerability scanner against production. Some checks intentionally exhaust memory, corrupt session state, or crash workers. A 502, timeout, or worker restart is an availability incident to investigate, not evidence of RCE or a successful mitigation.
+**Operational choice:** If PHP settings cannot be changed, emergency multipart blocking is the strongest request-side option shown here, but interrupts legitimate uploads and multipart forms. Response controls are additional PHP2Shell defense in depth, not a dedicated fix for all three CVEs. Keep nesting rules in **Log** until traffic has been assessed; changing them to Block does not complete remediation.
 
-## Preconditions and Read-Only Checks
+- [Azure Front Door configuration](#azure-front-door-waf): baseline, emergency Block, managed response protection, and readback.
+- [Application Gateway configuration](#azure-application-gateway-waf_v2): size enforcement, baseline, emergency Block, response rewrite, and readback.
+- [Validation](#data-plane-validation), [rollback](#rollback-by-component), and [vulnerability/source details](#vulnerability-details-and-remediation) follow the configuration sections.
+
+## Shared Preparation
 
 Run examples from the repository root in Bash. Replace all placeholders. Use Azure CLI 2.75.0 or later and jq 1.6 or later; check that your installed CLI exposes the parameters shown below. Front Door commands require the `front-door` extension.
 
@@ -65,23 +82,151 @@ Before any write:
 - Back up the policy, inspect the proposed changes, and schedule a window without concurrent policy writers. CLI read-modify-write operations are not an atomic concurrency lock.
 - Ensure request-side WAF diagnostic logs and origin access/error logs are available. The response rule `99006001` is an explicit exception: it produces neither WAF log entries nor hit counts. Readback confirms control-plane configuration, not data-plane enforcement.
 
-The backup-only commands below use the repository tools and do not modify Azure. Each creates a separate restricted backup directory; record the printed paths.
+Back up directly with Azure CLI before changing custom rules, policy size settings, managed-rule overrides, or rewrite sets/bindings. The following calls read Azure and write restricted local snapshots; they do not change Azure. Run only the applicable `az ... show` and `jq` pair. Stop on a failed command or invalid/empty snapshot. Use restricted storage, do not commit backups to Git, and do not overwrite later changes with a whole-resource restore. Keep the printed backup directory available for the platform steps below.
 
 ```bash
-bash azureapplicationgateway-waf/mitigate-php2shell.sh \
-	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" \
-	--policy-name "$AG_POLICY" --backup-only
+AG_GATEWAY_RG='<application-gateway-resource-group>'
+AG_GATEWAY='<existing-application-gateway-v2>'
+umask 077
+RESPONSE_BACKUP=$(mktemp -d "${TMPDIR:-/tmp}/php2shell-response.XXXXXX")
 
-bash azurefrontdoor-waf/mitigate-php2shell.sh \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" \
-	--policy-name "$FD_POLICY" --backup-only
+az network front-door waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--output json > "$RESPONSE_BACKUP/frontdoor-policy.json"
+jq -e '.managedRules.managedRuleSets | type == "array"' "$RESPONSE_BACKUP/frontdoor-policy.json"
+
+az network application-gateway waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --name "$AG_POLICY" \
+	--output json > "$RESPONSE_BACKUP/application-gateway-policy.json"
+jq -e '.id and .policySettings' "$RESPONSE_BACKUP/application-gateway-policy.json"
+
+az network application-gateway show \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_GATEWAY_RG" --name "$AG_GATEWAY" \
+	--output json > "$RESPONSE_BACKUP/application-gateway.json"
+jq -e '.id and .sku and (.requestRoutingRules | type == "array")' "$RESPONSE_BACKUP/application-gateway.json"
+
+printf 'Configuration snapshots: %s\n' "$RESPONSE_BACKUP"
 ```
 
-## CVE-2026-109618: Reduce OOM Exposure
+## Azure Front Door WAF
 
-### Recommended approach
+Use an existing policy scoped to the affected PHP domains/routes. All writes below require the shared preparation, backup, and approval. Require effective **Enabled + Prevention** settings and verify the security-policy/domain/path binding before relying on a Block. Do not replace the policy or its custom-rule collection.
 
-Upgrade PHP first. If that must wait, constrain request processing before it reaches PHP. Keep the existing nesting rules in Log until legitimate traffic has been assessed; 20 levels is a policy threshold, not an exploit boundary. Turning them into Block does not eliminate this vulnerability.
+### 1. CVE-2026-109619: Apply the Upload-Progress Baseline
+
+Use Azure CLI to read the current policy, then merge the existing [Front Door rule definitions](azurefrontdoor-waf/php2shell-rules.json) with jq. This JSON file is configuration data, not an executable script. The baseline contains three rules: upload progress **Block** at priority 500 and nesting **Log** at priorities 501/502. Do not pass the baseline file alone to `--custom-rules`: that replaces the collection and can remove unrelated rules.
+
+The following preparation makes no Azure changes. It requires Enabled/Prevention, preserves unrelated rules and other custom-rule properties, and rejects an existing name/priority collision rather than overwriting it. If baseline rules already exist, inspect their definitions and use a separately reviewed update; do not delete them just to rerun this first-install example. Review earlier Allow rules and rule quotas before proceeding. Stop on any error; do not run the apply block unless every preparation check succeeds.
+
+```bash
+az network front-door waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--output json > "$RESPONSE_BACKUP/frontdoor-baseline.before.json" &&
+jq -e '.policySettings.enabledState == "Enabled" and .policySettings.mode == "Prevention"' \
+	"$RESPONSE_BACKUP/frontdoor-baseline.before.json" &&
+jq -e --slurpfile baseline azurefrontdoor-waf/php2shell-rules.json '
+	(.customRules // {}) as $custom |
+	($custom.rules // []) as $existing |
+	$baseline[0].rules as $new |
+	if any($existing[]; . as $old |
+		any($new[]; .name == $old.name or .priority == $old.priority))
+	then error("Existing rule name or priority: stop and review")
+	else $custom + {rules: ($existing + $new)} end
+' "$RESPONSE_BACKUP/frontdoor-baseline.before.json" \
+	> "$RESPONSE_BACKUP/frontdoor-custom-rules.merged.json" &&
+jq . "$RESPONSE_BACKUP/frontdoor-custom-rules.merged.json"
+```
+
+Review the **complete** merged JSON, including earlier terminal Allow rules and all unrelated entries. Immediately before applying, re-read and compare the policy. Stop if this check fails or reports a difference; rebuild the plan from the changed policy instead. This detects observed drift but is not an atomic If-Match lock, so retain the no-concurrent-writers window.
+
+```bash
+az network front-door waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--output json > "$RESPONSE_BACKUP/frontdoor-baseline.preapply.json" &&
+diff -u <(jq -S . "$RESPONSE_BACKUP/frontdoor-baseline.before.json") \
+	<(jq -S . "$RESPONSE_BACKUP/frontdoor-baseline.preapply.json")
+```
+
+**Optional write after approval:** apply only the reviewed merged custom-rule collection. Do not change managed rules, settings, or SKU as part of this step. Stop on any failed command; read back and compare all custom rules, not just the upload-progress rule.
+
+```bash
+az network front-door waf-policy update \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--custom-rules "@$RESPONSE_BACKUP/frontdoor-custom-rules.merged.json" &&
+az network front-door waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--query '{settings:policySettings,custom:customRules,managed:managedRules}' --output json
+
+az network front-door waf-policy rule show \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--name BlockPhpSessionUploadProgress --output json
+```
+
+Confirm that all previous rules/settings/managed rules remain unchanged and that the three baseline rules have the expected actions and conditions. Readback is not a data-plane test. The Front Door baseline matches the default marker in inspected `RequestBody`. Confirm the actual `session.upload_progress.name`, test field-name-only matching, and do not assume coverage beyond the inspection boundary. For stronger containment, use step 2.
+
+### 2. CVE-2026-115560 and Stronger Containment: Block Multipart
+
+If the vulnerable PHP configuration cannot be excluded and you cannot disable upload progress at runtime, temporarily block declared `multipart/form-data` across the affected PHP scope. This also reduces multipart exposure relevant to CVE-2026-109618 and CVE-2026-109619, but does not close every path. Legitimate multipart forms/uploads will stop working.
+
+**Optional write:** the name must be new and priority `499` must be free and earlier than **every** matching terminal Allow. Review quotas. On a shared policy, include approved host/path conditions in the initial rule instead of applying this unscoped example. Do not overwrite an existing rule.
+
+```bash
+az network front-door waf-policy rule create \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--name EmergencyBlockPhpMultipart --priority 499 \
+	--disabled false --rule-type MatchRule --action Block \
+	--match-variable RequestHeader.Content-Type \
+	--operator Contains --values multipart/form-data --transforms Lowercase
+
+az network front-door waf-policy rule show \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--name EmergencyBlockPhpMultipart --output json
+```
+
+### 3. CVE-2026-109618: Request-Size Limitations
+
+Front Door does **not** expose Application Gateway's request-body/upload enforcement flags. Its 128 KB body-inspection boundary is not a configurable total decoded-request rejection cap. Do not invent a Front Door equivalent of `--max-request-body-size-in-kb`, rely on `Content-Length` alone, or assume a custom condition measures all uninspected bytes.
+
+If multipart uploads can be interrupted, use step 2. Otherwise, require decoded-size, part-count, per-part header-count, input-count, and nesting limits at a capable upstream/origin **before PHP parsing**. If no such limit is available, record the gap and escalate isolation/patching; the WAF policy alone cannot establish OOM safety.
+
+### 4. Additional PHP2Shell Protection: Enable Response Rule 99006001
+
+Microsoft expects rollout to finish on **October 28, 2026**. As of this runbook's October 24 review, verify availability rather than assuming the rule exists. It is **disabled by default**, in group `MS-ThreatIntel-Response-CVEs`, on DRS 2.0/2.1/2.2. Front Door Standard's custom-rule capability does not imply managed-DRS support; use a supported SKU such as Premium. Do not upgrade/replace an attached DRS just to run this example.
+
+```bash
+az network front-door waf-policy managed-rule-definition list \
+	--subscription "$SUBSCRIPTION" --output json
+
+az network front-door waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--query '{sku:sku,settings:policySettings,managed:managedRules}' --output json
+```
+
+Locate `99006001` in the **already attached** `Microsoft_DefaultRuleSet` version. If unavailable or rejected, retain request containment, record response protection as **not available**, and check rollout with Microsoft. Do not manufacture a custom rule with the same ID.
+
+**Optional write:** after backup and approval, use the following only if the target override is absent and the installed CLI's targeted add preserves existing groups/rules. If it exists, use a reviewed merge or edit that rule in the portal rather than appending a duplicate. Preserve exclusions, sensitivity, and all other overrides.
+
+```bash
+az network front-door waf-policy managed-rules override add \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--type Microsoft_DefaultRuleSet \
+	--rule-group-id MS-ThreatIntel-Response-CVEs --rule-id 99006001 \
+	--disabled false --action AnomalyScoring
+
+az network front-door waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--query 'managedRules.managedRuleSets' --output json
+```
+
+Compare the full managed-rule collection against the snapshot: only the intended override should change. Confirm `enabledState=Enabled`, `action=AnomalyScoring`, and the portal action **Block on anomaly**, which Microsoft requires for this response rule. Do not substitute normal `Block`, `Log`, or challenge actions. Review the ruleset-level anomaly action separately without silently changing it for all rules.
+
+The rule sanitizes potentially malicious response elements while returning the remaining content; do not expect a request-side 403. It generates **no WAF log entries or hit counts**. Use the response differential validation below; readback and a generic invalid-cookie fixture alone do not prove this proprietary signature works. This is defense in depth, not proof of remediation for any of the three CVEs.
+
+## Azure Application Gateway WAF_v2
+
+Use an existing PHP-scoped WAF policy and the actual gateway's routing/rewrite resources. The gateway resource group may differ from the policy resource group. All writes below require shared preparation, backup, and approval. These are **Application Gateway v2** recommendations, not Application Gateway for Containers commands.
+
+### 1. CVE-2026-109618: Enforce Request and Upload Limits
 
 For Application Gateway WAF_v2 with CRS 3.2 or a compatible newer engine, the following **optional write** enables body inspection and size enforcement. The example accepts at most 128 KB of non-file request data and a 32 MB file upload limit. These are illustrative business limits, not vulnerability-specific safe values. Do not raise a stricter existing limit just to match this example.
 
@@ -103,69 +248,64 @@ az network application-gateway waf-policy policy-setting list \
 
 Request-body inspection depth, request size enforcement, and file upload limits are different controls. File content is treated separately from non-file request data; these settings do not impose a 128 KB total multipart request cap. Review the documented file-limit buffer as well. Restore previous settings individually from the backup if rolling back; deleting a custom rule will not restore policy settings.
 
-Front Door does not expose the same Application Gateway size-setting parameters. Its documented 128 KB body-inspection boundary is not a configurable total decoded-request rejection limit. Do not rely on `Content-Length` alone or assume a custom size condition measures all uninspected bytes. If uploads are unnecessary, use the emergency multipart block below. Otherwise, require decoded-size, part-count, per-part header-count, input-count, and nesting limits at an upstream capable of enforcing them, or at the origin before PHP parsing.
-
-### Required owner follow-up
-
-If you cannot manage PHP configuration, escalate to the runtime owner. PHP documents administratively enforced `memory_limit=-1` as a partial mitigation, together with conservative `post_max_size` and resource isolation. Removing PHP's memory limit increases availability risk and must not be done without capacity review. Underlying allocation failures remain possible; do not substitute `RLIMIT_AS` or `RLIMIT_DATA`. WAF limits are not equivalent to these runtime changes.
-
-## CVE-2026-109619: Restrict Upload Progress, Then Patch
-
-### Recommended approach
+### 2. CVE-2026-109619: Apply the Upload-Progress Baseline
 
 The existing `BlockPhpSessionUploadProgress` rule already uses **Block**. It restricts multipart requests containing the default upload-progress marker; the two nesting rules do not cover all stale-state paths.
 
-Use the existing deployment tools for the Microsoft baseline. They call Azure CLI, preview by default, preserve unrelated rules, and check policy state, priority conflicts, and earlier Allow rules. **The baseline includes all three existing rules**, not a CVE-specific complete fix. It keeps both nesting rules in Log.
+Read and merge with Azure CLI and jq using the existing [Application Gateway rule definitions](azureapplicationgateway-waf/php2shell-rules.json). **The baseline includes all three rules**, not a CVE-specific complete fix: priority 90 Block and priorities 91/92 Log. Do not pass this file alone to `--custom-rules`, which replaces the custom-rule collection. The preparation below retains unrelated entries and stops on name/priority collisions. Existing baseline installations require a reviewed update rather than this first-install example. Check earlier Allow rules and quotas. Stop on any error before continuing.
 
 ```bash
-bash azureapplicationgateway-waf/mitigate-php2shell.sh \
-	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --policy-name "$AG_POLICY"
-
-bash azurefrontdoor-waf/mitigate-php2shell.sh \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY"
+az network application-gateway waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --name "$AG_POLICY" \
+	--output json > "$RESPONSE_BACKUP/application-gateway-baseline.before.json" &&
+jq -e '.policySettings.state == "Enabled" and .policySettings.mode == "Prevention"' \
+	"$RESPONSE_BACKUP/application-gateway-baseline.before.json" &&
+jq -e --slurpfile baseline azureapplicationgateway-waf/php2shell-rules.json '
+	(.customRules // []) as $existing |
+	$baseline[0] as $new |
+	if any($existing[]; . as $old |
+		any($new[]; .name == $old.name or .priority == $old.priority))
+	then error("Existing rule name or priority: stop and review")
+	else $existing + $new end
+' "$RESPONSE_BACKUP/application-gateway-baseline.before.json" \
+	> "$RESPONSE_BACKUP/application-gateway-custom-rules.merged.json" &&
+jq . "$RESPONSE_BACKUP/application-gateway-custom-rules.merged.json"
 ```
 
-Only after reviewing each preview and the application impact, these **optional writes** apply the baseline:
+Review the complete merged JSON and application impact. Re-read the policy immediately before applying; stop on failure or any difference. This snapshot is taken **after** step 1's approved size-setting changes, so it does not reuse a stale pre-change policy. The check is not an atomic concurrency lock.
 
 ```bash
-bash azureapplicationgateway-waf/mitigate-php2shell.sh \
-	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --policy-name "$AG_POLICY" --apply
-
-bash azurefrontdoor-waf/mitigate-php2shell.sh \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" --apply
+az network application-gateway waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --name "$AG_POLICY" \
+	--output json > "$RESPONSE_BACKUP/application-gateway-baseline.preapply.json" &&
+diff -u <(jq -S . "$RESPONSE_BACKUP/application-gateway-baseline.before.json") \
+	<(jq -S . "$RESPONSE_BACKUP/application-gateway-baseline.preapply.json")
 ```
 
-Verify the upload-progress rule through Azure CLI:
+**Optional write after approval:** update only the reviewed merged custom-rule array, then read back settings, managed rules, and all custom rules to check for unintended changes. Confirm all original entries remain, with the three baseline actions/conditions as expected. Stop on any command failure.
 
 ```bash
+az network application-gateway waf-policy update \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --name "$AG_POLICY" \
+	--custom-rules "@$RESPONSE_BACKUP/application-gateway-custom-rules.merged.json" &&
+az network application-gateway waf-policy show \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --name "$AG_POLICY" \
+	--query '{settings:policySettings,custom:customRules,managed:managedRules}' --output json
+
 az network application-gateway waf-policy custom-rule show \
 	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --policy-name "$AG_POLICY" \
 	--name BlockPhpSessionUploadProgress --output json
-
-az network front-door waf-policy rule show \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
-	--name BlockPhpSessionUploadProgress --output json
 ```
 
-Inventory the actual `session.upload_progress.name` across PHP pools/sites: the baseline uses the default `PHP_SESSION_UPLOAD_PROGRESS`. Custom names require separately reviewed coverage. Application Gateway uses parsed `PostArgs`; Front Door uses inspected `RequestBody`. Test a harmless request where only the field name contains the marker and the value is ordinary text. Neither matching model guarantees coverage of every encoding or oversized request.
+Inventory the actual `session.upload_progress.name` across PHP pools/sites: the baseline uses the default `PHP_SESSION_UPLOAD_PROGRESS`. Custom names require separately reviewed coverage. Application Gateway uses parsed `PostArgs`. Test a harmless request where only the field name contains the marker and the value is ordinary text; do not assume coverage of every encoding or oversized request.
 
-### Required owner follow-up
-
-Ask the runtime owner to disable `session.upload_progress.enabled` before request parsing and restart every worker. Do not rely on application `ini_set()` or FPM `.user.ini`. On PHP 8.5, disabling `fatal_error_backtraces` removes another confirmed path. Correct early configuration diagnostics and attacker-reachable fatal errors/timeouts. These measures remain partial: this CVE also involves non-upload state. A PHP update is the complete remediation.
-
-## CVE-2026-115560: Emergency Multipart Containment
-
-### Recommended approach
-
-First determine whether the application has all three prerequisites listed in the response table. WAF cannot inspect the application's serializer configuration or runtime calls. Do not invent signatures for `ini_set`, `php_serialize`, or serialized payload syntax: the request need not contain those strings.
+### 3. CVE-2026-115560 and Stronger Containment: Block Multipart
 
 PHP's documented mitigation is `session.upload_progress.enabled=0`. If you cannot change it and cannot rule out the vulnerable combination, an emergency option is to block all declared `multipart/form-data` traffic across the affected PHP scope. This sacrifices legitimate uploads and multipart forms, but avoids dependence on the progress field name and its location in the inspected body.
 
-The following are **optional writes to existing policies**, one example per platform. They add a separate rule; they do not edit the baseline rules. Use only PHP-scoped policies. On a shared policy, design and validate additional host/path conditions before applying; do not temporarily create a broad block and add scope later.
+The following is an **optional write to an existing policy**. It adds a separate rule without editing the baseline rules. Use only a PHP-scoped policy. On a shared policy, design and validate additional host/path conditions before applying; do not temporarily create a broad block and add scope later.
 
-Confirm `EmergencyBlockPhpMultipart` does not already exist. The sample priorities `89` and `499` must be free and precede every Allow rule that could match the affected traffic. Being earlier than the baseline does not mean being earlier than all Allow rules. Stop on a collision rather than overwriting or automatically renumbering rules. Review rule quotas and existing conditions before applying.
-
-### Application Gateway WAF_v2
+Confirm `EmergencyBlockPhpMultipart` does not already exist. Priority `89` must be free and precede every Allow rule that could match the affected traffic. Being earlier than the baseline does not mean being earlier than all Allow rules. Stop on a collision rather than overwriting or automatically renumbering rules. Review rule quotas and existing conditions before applying.
 
 The complete condition is supplied in the same create operation. The `negationConditon` spelling below follows the Application Gateway rule schema used by this repository.
 
@@ -181,114 +321,9 @@ az network application-gateway waf-policy custom-rule show \
 	--name EmergencyBlockPhpMultipart --output json
 ```
 
-### Azure Front Door WAF
-
-Front Door uses a different CLI and rule schema. The selector is expressed as `RequestHeader.Content-Type`; the full header condition is included at creation time.
-
-```bash
-az network front-door waf-policy rule create \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
-	--name EmergencyBlockPhpMultipart --priority 499 \
-	--disabled false --rule-type MatchRule --action Block \
-	--match-variable RequestHeader.Content-Type \
-	--operator Contains --values multipart/form-data --transforms Lowercase
-
-az network front-door waf-policy rule show \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
-	--name EmergencyBlockPhpMultipart --output json
-```
-
 These header-based rules do not depend on body-inspection depth. They still depend on correct policy scope, precedence, propagation, and consistent header interpretation between WAF and PHP. They are not proof that the CVE is fully mitigated. If this uncertainty is unacceptable, temporarily deny external access to the affected PHP service using a separately approved isolation change.
 
-### Roll Back Only the Emergency Rule
-
-After verifying a dedicated PHP fix or the runtime mitigation, review the current rule and remove only the rule added above. These are **optional writes**. Do not run them if a rule with that name predates this change or has since been repurposed. Confirm deletion and retain the backup/change record. Existing baseline rules and policy settings remain in place.
-
-```bash
-az network application-gateway waf-policy custom-rule delete \
-	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --policy-name "$AG_POLICY" \
-	--name EmergencyBlockPhpMultipart
-
-az network front-door waf-policy rule delete \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
-	--name EmergencyBlockPhpMultipart
-```
-
-For baseline rollback, use the platform-specific tool documentation instead. Its full custom-rule restore can overwrite later changes and is not interchangeable with deleting this one emergency rule.
-
-## Response-Side Defense in Depth
-
-These measures supplement request filtering for PHP2Shell; they do not prevent corruption inside PHP, undo origin-side execution, or establish remediation of CVE-2026-115560. Patch every serving runtime and rebuild/redeploy affected container images: updating the host does not update PHP embedded in an image.
-
-| Platform | Microsoft guidance as reviewed on October 24 | Verification requirement |
-| --- | --- | --- |
-| Front Door with supported managed DRS | Enable response rule `99006001` in `MS-ThreatIntel-Response-CVEs`, supported on DRS 2.0, 2.1, and 2.2. | Confirm actual SKU/ruleset availability and response behavior, not log hits. |
-| Application Gateway v2 | Add a conditional response-header rewrite to remove the matching `Set-Cookie` header. | Confirm regex support, route association, and preservation of other cookies. |
-| Application Gateway for Containers | Request-side custom rules only in the cited guidance; regex response rewrite is not supported. A managed response rule was announced for later. | Do not apply the Application Gateway v2 commands to this product or claim response protection is available. |
-
-### Back Up Response Configuration Separately
-
-The repository scripts restore **custom request rules only**. Their rollback does not restore Front Door managed-rule overrides, Application Gateway rewrite sets, route associations, or policy size settings. Keep the relevant snapshots and an approved, component-specific rollback record. The gateway resource group can differ from the WAF policy resource group.
-
-These calls read Azure and write restricted local snapshots; they do not change Azure. Stop on any failed command or invalid/empty snapshot. Do not commit backups containing infrastructure details or response evidence to Git.
-
-```bash
-AG_GATEWAY_RG='<application-gateway-resource-group>'
-AG_GATEWAY='<existing-application-gateway-v2>'
-umask 077
-RESPONSE_BACKUP=$(mktemp -d "${TMPDIR:-/tmp}/php2shell-response.XXXXXX")
-
-az network front-door waf-policy show \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
-	--output json > "$RESPONSE_BACKUP/frontdoor-policy.json"
-jq -e '.managedRules.managedRuleSets | type == "array"' "$RESPONSE_BACKUP/frontdoor-policy.json"
-
-az network application-gateway show \
-	--subscription "$SUBSCRIPTION" --resource-group "$AG_GATEWAY_RG" --name "$AG_GATEWAY" \
-	--output json > "$RESPONSE_BACKUP/application-gateway.json"
-jq -e '.id and .sku and (.requestRoutingRules | type == "array")' "$RESPONSE_BACKUP/application-gateway.json"
-
-printf 'Response configuration snapshots: %s\n' "$RESPONSE_BACKUP"
-```
-
-### Front Door: Enable and Read Back 99006001
-
-Microsoft says rollout is expected to finish on **October 28, 2026**. On this runbook's October 24 review date, do not assume the rule is available everywhere. It is **disabled by default** and takes effect only with the portal action **Block on anomaly**. The CLI rule action for anomaly scoring is `AnomalyScoring`; verify the resulting portal action as well. Do not substitute a normal `Block`, `Log`, or challenge action.
-
-First inspect the actual managed rule definitions and policy. Front Door Standard's custom-rule capability does not imply access to managed DRS; use a supported SKU such as Premium. Do not replace or upgrade the current DRS just to run this example: a version migration needs its own exclusion/override review.
-
-```bash
-az network front-door waf-policy managed-rule-definition list \
-	--subscription "$SUBSCRIPTION" --output json
-
-az network front-door waf-policy show \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
-	--query '{sku:sku,settings:policySettings,managed:managedRules}' --output json
-```
-
-Locate `99006001` in group `MS-ThreatIntel-Response-CVEs` in the **already attached** `Microsoft_DefaultRuleSet` version 2.0, 2.1, or 2.2. If absent, unavailable, or rejected by the service, record response protection as **not available**, retain request containment, and check rollout with Microsoft. Do not manufacture a custom rule with the same ID.
-
-The following is an **optional write**, after approval and backup. Use it only after confirming that the target override is absent and that the installed CLI's targeted add preserves existing groups/rules. If an override already exists, edit that entry through a reviewed merge or the portal rather than appending a duplicate. Preserve its exclusions and sensitivity; do not replace the entire `managedRules` collection.
-
-```bash
-az network front-door waf-policy managed-rules override add \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
-	--type Microsoft_DefaultRuleSet \
-	--rule-group-id MS-ThreatIntel-Response-CVEs --rule-id 99006001 \
-	--disabled false --action AnomalyScoring
-
-az network front-door waf-policy show \
-	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
-	--query 'managedRules.managedRuleSets' --output json
-```
-
-Compare the full managed-rule collection with the snapshot: only the intended override should change. Confirm `enabledState=Enabled`, `action=AnomalyScoring`, the portal's **Block on anomaly** action, effective Enabled/Prevention policy, and the correct security-policy/domain/path bindings. Preserve/review the ruleset-level anomaly action separately; do not silently change it for all rules.
-
-**Important:** Microsoft documents response sanitization, not the usual request-block response. Potentially malicious elements are removed while the remaining response is returned. **This rule generates no WAF log entries or hit counts.** Neither an absent `99006001` log nor a non-403 response establishes failure. Conversely, readback alone does not prove sanitization works. Use response differential evidence below; a generic invalid-cookie fixture is not guaranteed to trigger this proprietary managed signature.
-
-Rollback must restore only the target override to its recorded prior state. If it did not previously exist, remove only the newly added override using the documented managed-rule override operation and confirm the group retains all unrelated entries. If it existed, restore its previous enabled state, action, exclusions, and sensitivity. Do not restore the entire policy over newer changes or disable the policy to undo one rule. Repeat functional tests and document the resulting loss of response protection.
-
-### Application Gateway v2: Conditional Set-Cookie Rewrite
+### 4. Additional PHP2Shell Protection: Rewrite Suspicious Set-Cookie
 
 Use the following expression exactly as published in Microsoft's October 22 guidance, matching the **response** `Set-Cookie` value, not the request `Cookie` header:
 
@@ -340,6 +375,29 @@ az network application-gateway rule update \
 Require successful gateway provisioning and read back the full set and route/path-map references. Compare with the snapshot, including rule order and any later rule that could reintroduce a deleted header. Removing the matched header also removes its `Path`, `Domain`, `Secure`, `HttpOnly`, and `SameSite` attributes; if choosing replacement instead, replace the **whole** value deliberately and verify those attributes. Do not insert a fake reusable session identifier.
 
 For rollback, delete only the newly added rewrite rule from the existing set after confirming its current definition and ownership. If a new set/binding was introduced, restore the exact previous Basic/path/default binding first, verify traffic, and remove the new set only when no route references it. Preserve all pre-existing rewrites. Gateway snapshots are review/restore inputs, not a safe whole-resource PUT payload. Repeat login, cookie, and routing checks after rollback.
+
+## Rollback by Component
+
+After verifying a dedicated PHP fix or the runtime mitigation, review the current emergency rule and remove only the rule added in this change. Run only your platform's command below. These are **optional writes**; do not run them if that name predates this change or has since been repurposed. Confirm deletion and retain the backup/change record. Existing baseline rules and policy settings remain in place.
+
+```bash
+az network front-door waf-policy rule delete \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" \
+	--name EmergencyBlockPhpMultipart
+
+az network application-gateway waf-policy custom-rule delete \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --policy-name "$AG_POLICY" \
+	--name EmergencyBlockPhpMultipart
+```
+
+| Changed component | Required rollback |
+| --- | --- |
+| Baseline custom rules | Compare the current collection with the platform's `*-baseline.before.json`. For a first install, remove only the three newly added, still-owned baseline rules using the platform custom-rule delete commands after verifying their current definitions; retain unrelated/later changes. A full custom-rule restore can overwrite later changes. The optional tools document that alternative, not a single-rule rollback. |
+| Application Gateway body/upload settings | Restore the previous individual settings from `application-gateway-policy.json`; a custom-rule restore does not cover them. |
+| Front Door response override | Restore only `99006001` to its prior state/action/exclusions/sensitivity. If previously absent, remove only the new override and preserve all other group entries. Do not remove the entire DRS or disable WAF. |
+| Gateway response rewrite/binding | Remove only the added rule; if a new binding/set was introduced, restore the precise prior Basic/default/path binding before removing an unreferenced new set. Preserve other rewrites. |
+
+Re-read the changed component, repeat login/upload/routing and WAF checks, and record both restored behavior and lost protection. Do not perform a blind whole-policy/gateway restore over concurrent changes.
 
 ## Data-Plane Validation
 
@@ -445,7 +503,69 @@ Promote only with reviewed request-control evidence, verified response behavior 
 
 The commands in this document have not been deployed against a live Azure policy. Local syntax checks do not validate service acceptance, propagation, matching semantics, or protection against exploitation.
 
+## Vulnerability Details and Remediation
+
+| Vulnerability | Relevant behavior | Remaining risk despite WAF controls |
+| --- | --- | --- |
+| CVE-2026-109618 | Out-of-memory handling leaves partially initialized request state unsafe during cleanup. | Small requests, multipart expansion, and application-specific allocations can still exhaust memory. WAF size/nesting limits do not prove memory safety. |
+| CVE-2026-109619 | Request-owned state survives into a later request handled by the same worker. | Upload progress is one entry point; other stale-state producers and consumers are not covered by a marker or multipart block. |
+| CVE-2026-115560 | Upload progress is enabled, the initial serializer is `php_binary` or `php_serialize`, and application code switches it to `php` before `session_start()`. | WAF cannot establish these server-side prerequisites. Do not invent request signatures for `ini_set`, `php_serialize`, or serialized syntax: those strings need not be present. |
+
+**Patch status:** PHP 8.2.35, 8.3.36, 8.4.27, and 8.5.12 contain fixes for CVE-2026-109618 and CVE-2026-109619. Use these or later supported patched releases, or verified vendor backports. Do not assume those releases also fix CVE-2026-115560: the October 23 notice says its full advisory will accompany the next regular bugfix release. Patch every serving runtime and rebuild/redeploy affected images; updating a host does not update PHP inside containers.
+
+If you cannot manage PHP settings, escalate to the runtime owner. For CVE-2026-109618, PHP documents administratively enforced `memory_limit=-1` as a partial mitigation with conservative `post_max_size` and resource isolation. Removing PHP's memory limit increases availability risk and requires capacity review. Underlying allocation failures remain possible; do not substitute `RLIMIT_AS` or `RLIMIT_DATA`. WAF limits are not equivalent to these runtime changes.
+
+For upload-progress paths and CVE-2026-115560, ask the owner to disable `session.upload_progress.enabled` **before parsing** and restart every worker. Do not rely on application `ini_set()` or FPM `.user.ini`. For CVE-2026-109619 on PHP 8.5, disabling `fatal_error_backtraces` removes another confirmed path. Correct early configuration diagnostics and attacker-reachable fatal errors/timeouts. These steps do not replace the PHP update for non-upload stale state.
+
+Response sanitization cannot prevent corruption inside PHP or undo execution at the origin. Application Gateway for Containers is a separate product: the cited guidance provides request-side custom rules only, without regex response rewriting; a managed response rule was announced for later. Do not apply the v2 rewrite commands or Front Door rule ID to it.
+
+## Source Interpretation and Coverage
+
+The [Microsoft upgrade and Azure WAF guidance](https://techcommunity.microsoft.com/blog/azurenetworksecurityblog/addressing-php2shell-cve-2026-109618-and-cve-2026-109619-upgrade-guidance-and-az/4566623) calls for **request-side and response-side controls**, not just the three custom rules. Its October 22 revision supplies the cookie rewrite expression above. PHP advisories remain authoritative for affected configurations and remediation.
+
+The third-party [ikow/php2shell-poc repository](https://github.com/ikow/php2shell-poc/tree/31519e6d8a84dee1df1262961ed1bebb65accadd) is used as a test-design reference, pinned to commit `31519e6d8a84dee1df1262961ed1bebb65accadd`. Its chain names, reliability claims, and scanner results are research observations, not Azure protection guarantees or a one-to-one mapping to CVEs. Its serializer-mismatch chain is not proof of the precise CVE-2026-115560 runtime-switch prerequisite. Do not copy its ModSecurity rules directly into an Azure policy.
+
+| Source observation | Operational consequence | What a passing WAF check does not prove |
+| --- | --- | --- |
+| Chains A/C use upload progress and require additional application/configuration conditions. | Test the default and actual configured progress field names; include filename-bearing multipart controls. | Blocking a marker does not establish that all injection or deserialization paths are closed. |
+| Chain B requires attacker-controlled deserialization. | Keep patching and application review separate from upload controls. | A multipart block does not protect arbitrary application `unserialize()` calls. |
+| Chain D concerns OOM during mod_php request startup. | Test size enforcement and supported framing without causing OOM; do not restrict mitigation to named upload routes. | A small accepted request or a rejected large request does not demonstrate memory safety. |
+| Chain E describes a session-dependent producer followed by an early consumer on another PHP endpoint. | Cover all affected PHP routes, including extensionless and no-session endpoints; correlate worker failures separately. | A single-request test cannot reproduce or exclude cross-request worker-state exploitation. |
+| Detection examples inspect filenames, response errors, and chunked framing. | Use supported Azure match variables, origin telemetry, and safe fixtures; verify framing after proxy normalization. | Absence of a visible `Transfer-Encoding` header or an error string is not proof of safety. |
+
+Do not execute the repository's exploit or vulnerability scanner against production. Some checks intentionally exhaust memory, corrupt session state, or crash workers. A 502, timeout, or worker restart is an availability incident to investigate, not evidence of RCE or a successful mitigation.
+
 ## Repository Tools
+
+### Optional Script Workflow
+
+The Azure CLI steps above are the primary procedure. The repository scripts are an alternative for deploying the same baseline, not an additional required step; do not run both workflows to install it twice. They preview by default, merge unrelated rules, detect priority/earlier-Allow issues, and support backup, apply, and rollback workflows. Read the platform documentation before using them.
+
+Run only your platform's commands. `--backup-only` reads Azure and saves a restricted local backup; the command without an action flag previews; `--apply` is an **optional Azure write** after review and approval.
+
+```bash
+bash azurefrontdoor-waf/mitigate-php2shell.sh \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" --backup-only
+
+bash azurefrontdoor-waf/mitigate-php2shell.sh \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY"
+
+bash azurefrontdoor-waf/mitigate-php2shell.sh \
+	--subscription "$SUBSCRIPTION" --resource-group "$FD_RG" --policy-name "$FD_POLICY" --apply
+```
+
+```bash
+bash azureapplicationgateway-waf/mitigate-php2shell.sh \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --policy-name "$AG_POLICY" --backup-only
+
+bash azureapplicationgateway-waf/mitigate-php2shell.sh \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --policy-name "$AG_POLICY"
+
+bash azureapplicationgateway-waf/mitigate-php2shell.sh \
+	--subscription "$SUBSCRIPTION" --resource-group "$AG_RG" --policy-name "$AG_POLICY" --apply
+```
+
+The scripts' restore covers **custom request rules only**, not policy size settings, managed-rule overrides, or gateway rewrite sets/bindings. Keep the separate CLI snapshots and component-specific rollback plan for those changes. Their backups have their own format; do not pass the raw CLI snapshots above to a script rollback operation.
 
 - [Application Gateway WAF tool and operational safeguards](azureapplicationgateway-waf/README.md)
 - [Front Door WAF tool and operational safeguards](azurefrontdoor-waf/README.md)
@@ -466,6 +586,8 @@ The commands in this document have not been deployed against a live Azure policy
 - [Application Gateway rewrite ARM schema and headerValueMatcher](https://learn.microsoft.com/en-us/azure/templates/microsoft.network/2025-01-01/applicationgateways)
 - [Application Gateway routing-rule association CLI](https://learn.microsoft.com/en-us/cli/azure/network/application-gateway/rule?view=azure-cli-latest)
 - [Front Door custom-rule CLI](https://learn.microsoft.com/en-us/cli/azure/network/front-door/waf-policy/rule?view=azure-cli-latest)
+- [Front Door policy update and custom-rules JSON input](https://learn.microsoft.com/en-us/cli/azure/network/front-door/waf-policy?view=azure-cli-latest#az-network-front-door-waf-policy-update)
+- [Application Gateway policy update and custom-rules JSON input](https://learn.microsoft.com/en-us/cli/azure/network/application-gateway/waf-policy?view=azure-cli-latest#az-network-application-gateway-waf-policy-update)
 - [Front Door available managed-rule definitions CLI](https://learn.microsoft.com/en-us/cli/azure/network/front-door/waf-policy/managed-rule-definition?view=azure-cli-latest)
 - [Front Door managed-rule override CLI](https://learn.microsoft.com/en-us/cli/azure/network/front-door/waf-policy/managed-rules/override?view=azure-cli-latest)
 - [Front Door DRS, anomaly scoring, and SKU availability](https://learn.microsoft.com/en-us/azure/web-application-firewall/afds/waf-front-door-drs)

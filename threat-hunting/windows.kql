@@ -35,15 +35,15 @@ union
 | extend PhpVersion = extract(@"^(\d+\.\d+\.\d+)(?:\.\d+)?$", 1, ObservedVersion)
 | extend ParsedVersion = parse_version(PhpVersion)
 | extend VersionAssessment = case(
-	isnull(ParsedVersion), "版本未知，需人工確認",
-	ParsedVersion >= parse_version("5.4.0") and ParsedVersion < parse_version("8.2.0"), "公告列為 EOL，需遷移",
-	PhpVersion startswith "8.2." and ParsedVersion < parse_version("8.2.35"), "低於公告修補門檻",
-	PhpVersion startswith "8.3." and ParsedVersion < parse_version("8.3.36"), "低於公告修補門檻",
-	PhpVersion startswith "8.4." and ParsedVersion < parse_version("8.4.27"), "低於公告修補門檻",
-	PhpVersion startswith "8.5." and ParsedVersion < parse_version("8.5.12"), "低於公告修補門檻",
+	isnull(ParsedVersion), "Unknown version; manual verification required",
+	ParsedVersion >= parse_version("5.4.0") and ParsedVersion < parse_version("8.2.0"), "Listed as EOL in the advisory; migration required",
+	PhpVersion startswith "8.2." and ParsedVersion < parse_version("8.2.35"), "Below the advisory's patched version threshold",
+	PhpVersion startswith "8.3." and ParsedVersion < parse_version("8.3.36"), "Below the advisory's patched version threshold",
+	PhpVersion startswith "8.4." and ParsedVersion < parse_version("8.4.27"), "Below the advisory's patched version threshold",
+	PhpVersion startswith "8.5." and ParsedVersion < parse_version("8.5.12"), "Below the advisory's patched version threshold",
 	PhpVersion startswith "8.2." or PhpVersion startswith "8.3."
-		or PhpVersion startswith "8.4." or PhpVersion startswith "8.5.", "達公告版本門檻，仍須確認修補狀態",
-	"公告範圍外，需人工確認")
+		or PhpVersion startswith "8.4." or PhpVersion startswith "8.5.", "Meets the advisory's version threshold; patch status still requires verification",
+	"Outside the advisory's scope; manual verification required")
 | summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Events = count(),
 			Evidence = make_set(Evidence, 10)
 	by DeviceId, DeviceName, PhpFileName, PhpPath, ObservedVersion, VersionAssessment
